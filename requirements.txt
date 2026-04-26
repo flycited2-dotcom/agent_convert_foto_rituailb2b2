@@ -1,0 +1,5 @@
+playwright>=1.49.0
+python-telegram-bot>=21.7
+python-dotenv>=1.0.0
+pillow>=10.4.0
+pywin32>=306; sys_platform == "win32"
