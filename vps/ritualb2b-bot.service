@@ -1,0 +1,17 @@
+[Unit]
+Description=RitualB2B Telegram Bot
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/ritualb2b
+ExecStart=/root/ritualb2b/venv/bin/python vps_bot.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
