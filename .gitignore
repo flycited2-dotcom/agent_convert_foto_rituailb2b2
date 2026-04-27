@@ -24,3 +24,9 @@ inspect_state.py
 !processed/.gitkeep
 !failed/.gitkeep
 !logs/.gitkeep
+
+# Google Drive credentials (секретные — не коммитить)
+gdrive_token.json
+gdrive_oauth_client.json
+client_secret_*.json
+foto-ritualb2b-*.json
