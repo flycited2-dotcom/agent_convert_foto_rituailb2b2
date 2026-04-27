@@ -75,10 +75,28 @@ async def paste_text(page: Page, text: str) -> None:
 
 
 async def submit(page: Page) -> None:
-    # У ChatGPT с вложениями Enter не отправляет — нужен клик по send-button.
-    # Кнопка disabled пока не догрузятся attachments — ждём enabled-состояния.
-    btn = page.locator('button[data-testid="send-button"]:not([disabled])')
-    await btn.wait_for(state="visible", timeout=60000)
+    """Ждём пока кнопка send-button станет кликабельной, затем нажимаем.
+
+    ChatGPT блокирует кнопку двумя способами (меняется от версии к версии):
+      - HTML-атрибут  disabled
+      - aria-disabled="true"
+    Проверяем оба, ждём до 120 сек (3 фото на медленном канале).
+    """
+    btn = page.locator('button[data-testid="send-button"]')
+    await btn.wait_for(state="visible", timeout=30000)  # кнопка должна появиться быстро
+
+    for elapsed in range(120):
+        is_disabled = await btn.evaluate(
+            "el => el.disabled || el.getAttribute('aria-disabled') === 'true'"
+        )
+        if not is_disabled:
+            break
+        if elapsed % 15 == 0:
+            log.info("Жду готовности send-button… %d сек", elapsed)
+        await asyncio.sleep(1)
+    else:
+        raise RuntimeError("send-button не стал активным за 120 сек (файлы не загрузились?)")
+
     await btn.click()
     log.info("Submit нажат")
 
@@ -86,9 +104,17 @@ async def submit(page: Page) -> None:
 async def wait_for_generation(page: Page, timeout_ms: int) -> None:
     log.info("Жду результат до %d сек…", timeout_ms // 1000)
     # Кнопка "👍 хорошее изображение" появляется только когда картинка готова
-    await page.wait_for_selector(
-        GENERATED_READY_SELECTOR, state="visible", timeout=timeout_ms
-    )
+    try:
+        await page.wait_for_selector(
+            GENERATED_READY_SELECTOR, state="visible", timeout=timeout_ms
+        )
+    except Exception:
+        # Grace-period 30 сек: ChatGPT мог закончить буквально только что,
+        # не бросаем задачу из-за нескольких лишних секунд генерации.
+        log.warning("Основной таймаут истёк — жду ещё 30 сек (grace period)…")
+        await page.wait_for_selector(
+            GENERATED_READY_SELECTOR, state="visible", timeout=30000
+        )
     log.info("Картинка готова, ждём полной загрузки пикселей…")
     # Дополнительно — дождаться img.complete && naturalWidth > 1000
     for _ in range(40):
