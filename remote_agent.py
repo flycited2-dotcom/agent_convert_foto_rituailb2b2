@@ -173,44 +173,45 @@ async def agent_loop(api_url: str) -> None:
                 MAX_ATTEMPTS = 3
                 last_error: Exception | None = None
 
-                for attempt in range(1, MAX_ATTEMPTS + 1):
-                    try:
-                        if attempt > 1:
-                            log.warning("Попытка %d/%d для задачи %d…", attempt, MAX_ATTEMPTS, job_id)
-                            await asyncio.sleep(15)
+                try:
+                    for attempt in range(1, MAX_ATTEMPTS + 1):
+                        try:
+                            if attempt > 1:
+                                log.warning("Попытка %d/%d для задачи %d…", attempt, MAX_ATTEMPTS, job_id)
+                                await asyncio.sleep(15)
 
-                        # --- Обрабатываем через ChatGPT ---
-                        output_path = await process_one_file(tmp_input)
-                        log.info("Обработано → %s", output_path)
-                        last_error = None
-                        break  # успех
+                            # --- Обрабатываем через ChatGPT ---
+                            output_path = await process_one_file(tmp_input)
+                            log.info("Обработано → %s", output_path)
+                            last_error = None
+                            break  # успех
 
-                    except Exception as e:
-                        last_error = e
-                        log.warning("Попытка %d/%d не удалась: %s", attempt, MAX_ATTEMPTS, e)
+                        except Exception as e:
+                            last_error = e
+                            log.warning("Попытка %d/%d не удалась: %s", attempt, MAX_ATTEMPTS, e)
 
-                if last_error is not None:
-                    # Все попытки провалились — сообщаем VPS
-                    log.error("Задача %d провалилась после %d попыток: %s", job_id, MAX_ATTEMPTS, last_error)
-                    try:
-                        await client.post(
-                            f"{api_url}/api/fail/{job_id}",
-                            headers=headers,
-                            data={"error": str(last_error)},
-                        )
-                    except Exception:
-                        pass
-                else:
-                    # --- Загружаем результат на VPS ---
-                    async with httpx.AsyncClient(timeout=120) as up:
-                        with open(output_path, "rb") as f:
-                            r = await up.post(
-                                f"{api_url}/api/complete/{job_id}",
+                    if last_error is not None:
+                        # Все попытки провалились — сообщаем VPS
+                        log.error("Задача %d провалилась после %d попыток: %s", job_id, MAX_ATTEMPTS, last_error)
+                        try:
+                            await client.post(
+                                f"{api_url}/api/fail/{job_id}",
                                 headers=headers,
-                                files={"result": ("result.png", f, "image/png")},
+                                data={"error": str(last_error)},
                             )
-                    r.raise_for_status()
-                    log.info("Загружено на VPS: %s", r.json())
+                        except Exception:
+                            pass
+                    else:
+                        # --- Загружаем результат на VPS ---
+                        async with httpx.AsyncClient(timeout=120) as up:
+                            with open(output_path, "rb") as f:
+                                r = await up.post(
+                                    f"{api_url}/api/complete/{job_id}",
+                                    headers=headers,
+                                    files={"result": ("result.png", f, "image/png")},
+                                )
+                        r.raise_for_status()
+                        log.info("Загружено на VPS: %s", r.json())
 
                 finally:
                     tmp_input.unlink(missing_ok=True)
