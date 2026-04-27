@@ -120,16 +120,18 @@ async def fail_job(
     if not row:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    # Перемещаем входное фото в failed/
+    # Перемещаем входное фото в failed/ и запоминаем имя для кнопки «Повторить»
+    failed_filename = None
     src = INPUT_DIR / row["input_filename"]
     if src.exists():
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        src.rename(FAILED_DIR / f"{ts}_{row['input_filename']}")
+        failed_filename = f"{ts}_{row['input_filename']}"
+        src.rename(FAILED_DIR / failed_filename)
 
     with db_conn() as conn:
         conn.execute(
-            "UPDATE jobs SET status='failed', error_text=?, updated_at=? WHERE id=?",
-            (error, datetime.now().isoformat(), job_id),
+            "UPDATE jobs SET status='failed', failed_filename=?, error_text=?, updated_at=? WHERE id=?",
+            (failed_filename, error, datetime.now().isoformat(), job_id),
         )
         conn.commit()
 

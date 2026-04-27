@@ -69,12 +69,18 @@ def init_db() -> None:
                 status          TEXT    NOT NULL DEFAULT 'pending',
                 created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                output_filename TEXT,
+                output_filename   TEXT,
                 archived_filename TEXT,
+                failed_filename   TEXT,
                 error_text      TEXT,
                 result_sent     INTEGER DEFAULT 0
             )
         """)
+        # Миграция: добавляем failed_filename если его нет (для существующих БД)
+        try:
+            conn.execute("ALTER TABLE jobs ADD COLUMN failed_filename TEXT")
+        except Exception:
+            pass
         conn.commit()
 
 
@@ -192,6 +198,28 @@ async def on_callback(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         await q.message.reply_text(f"♻️ Поставил на повторную генерацию. В очереди: {pending}.")
         return
 
+    if data.startswith("retry_failed:"):
+        failed_name = data[len("retry_failed:"):]
+        src = FAILED_DIR / failed_name
+        if not src.exists():
+            await q.message.reply_text(
+                f"⚠️ Файл «{failed_name}» не найден в failed/. Пришли фото заново."
+            )
+            return
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+        new_filename = f"retry_{ts}_{failed_name}"
+        shutil.copyfile(src, INPUT_DIR / new_filename)
+        with db_conn() as conn:
+            conn.execute(
+                "INSERT INTO jobs (chat_id, input_filename) VALUES (?, ?)",
+                (q.message.chat_id, new_filename),
+            )
+            conn.commit()
+        with db_conn() as conn:
+            pending = conn.execute("SELECT COUNT(*) FROM jobs WHERE status='pending'").fetchone()[0]
+        await q.message.reply_text(f"🔄 Поставил на повтор. В очереди: {pending}.")
+        return
+
     if data.startswith("bad:"):
         bad_name = data[len("bad:"):]
         src = OUTPUT_DIR / bad_name
@@ -260,12 +288,23 @@ async def result_sender(app: Application) -> None:
 
             for row in failed_rows:
                 try:
+                    # Кнопка «Повторить» если есть файл в failed/
+                    keyboard = None
+                    if row["failed_filename"]:
+                        keyboard = InlineKeyboardMarkup([[
+                            InlineKeyboardButton(
+                                "🔄 Повторить",
+                                callback_data=f"retry_failed:{row['failed_filename']}",
+                            )
+                        ]])
                     await app.bot.send_message(
                         chat_id=row["chat_id"],
                         text=(
-                            f"❌ Ошибка при обработке:\n{row['error_text']}\n\n"
-                            "Попробуй позже или пришли другое фото."
+                            f"❌ Ошибка при обработке (3 попытки):\n"
+                            f"{row['error_text']}\n\n"
+                            "Нажми «Повторить» или пришли фото заново."
                         ),
+                        reply_markup=keyboard,
                     )
                     with db_conn() as conn:
                         conn.execute("UPDATE jobs SET result_sent=1 WHERE id=?", (row["id"],))

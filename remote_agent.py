@@ -170,11 +170,37 @@ async def agent_loop(api_url: str) -> None:
                 tmp_input.write_bytes(r.content)
 
                 output_path: Path | None = None
-                try:
-                    # --- Обрабатываем через ChatGPT ---
-                    output_path = await process_one_file(tmp_input)
-                    log.info("Обработано → %s", output_path)
+                MAX_ATTEMPTS = 3
+                last_error: Exception | None = None
 
+                for attempt in range(1, MAX_ATTEMPTS + 1):
+                    try:
+                        if attempt > 1:
+                            log.warning("Попытка %d/%d для задачи %d…", attempt, MAX_ATTEMPTS, job_id)
+                            await asyncio.sleep(15)
+
+                        # --- Обрабатываем через ChatGPT ---
+                        output_path = await process_one_file(tmp_input)
+                        log.info("Обработано → %s", output_path)
+                        last_error = None
+                        break  # успех
+
+                    except Exception as e:
+                        last_error = e
+                        log.warning("Попытка %d/%d не удалась: %s", attempt, MAX_ATTEMPTS, e)
+
+                if last_error is not None:
+                    # Все попытки провалились — сообщаем VPS
+                    log.error("Задача %d провалилась после %d попыток: %s", job_id, MAX_ATTEMPTS, last_error)
+                    try:
+                        await client.post(
+                            f"{api_url}/api/fail/{job_id}",
+                            headers=headers,
+                            data={"error": str(last_error)},
+                        )
+                    except Exception:
+                        pass
+                else:
                     # --- Загружаем результат на VPS ---
                     async with httpx.AsyncClient(timeout=120) as up:
                         with open(output_path, "rb") as f:
@@ -185,17 +211,6 @@ async def agent_loop(api_url: str) -> None:
                             )
                     r.raise_for_status()
                     log.info("Загружено на VPS: %s", r.json())
-
-                except Exception as e:
-                    log.exception("Ошибка задачи %d: %s", job_id, e)
-                    try:
-                        await client.post(
-                            f"{api_url}/api/fail/{job_id}",
-                            headers=headers,
-                            data={"error": str(e)},
-                        )
-                    except Exception:
-                        pass
 
                 finally:
                     tmp_input.unlink(missing_ok=True)
