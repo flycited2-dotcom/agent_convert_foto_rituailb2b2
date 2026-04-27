@@ -39,7 +39,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("remote_agent")
 
-from config import DELAY_BETWEEN_JOBS_SEC, LOGS_DIR  # noqa: E402
+from config import DELAY_BETWEEN_JOBS_SEC, GDRIVE_CREDENTIALS_JSON, GDRIVE_FOLDER_ID  # noqa: E402
 from agent import process_one_file  # noqa: E402
 
 # --- SSH / API config (из .env) ---
@@ -154,7 +154,8 @@ async def agent_loop(api_url: str) -> None:
     headers = {"x-agent-token": VPS_API_TOKEN}
     log.info("Агент запущен. API: %s  Опрос каждые %d сек.", api_url, POLL_INTERVAL)
 
-    async with httpx.AsyncClient(timeout=30) as client:
+    # trust_env=False отключает системный прокси Windows (иначе 503 через Clash/v2ray)
+    async with httpx.AsyncClient(timeout=30, trust_env=False) as client:
         while True:
             try:
                 # --- Получаем следующую задачу ---
@@ -191,6 +192,7 @@ async def agent_loop(api_url: str) -> None:
                             last_error = None
                             break  # успех
 
+
                         except Exception as e:
                             last_error = e
                             log.warning("Попытка %d/%d не удалась: %s", attempt, MAX_ATTEMPTS, e)
@@ -207,8 +209,20 @@ async def agent_loop(api_url: str) -> None:
                         except Exception:
                             pass
                     else:
+                        # --- Загружаем на Google Drive (если настроено) ---
+                        if GDRIVE_CREDENTIALS_JSON and GDRIVE_FOLDER_ID:
+                            try:
+                                from gdrive import upload_file as gdrive_upload
+                                link = await asyncio.get_event_loop().run_in_executor(
+                                    None, gdrive_upload, output_path,
+                                    GDRIVE_FOLDER_ID, GDRIVE_CREDENTIALS_JSON,
+                                )
+                                log.info("Google Drive: %s", link)
+                            except Exception as gde:
+                                log.warning("Google Drive upload failed: %s", gde)
+
                         # --- Загружаем результат на VPS ---
-                        async with httpx.AsyncClient(timeout=120) as up:
+                        async with httpx.AsyncClient(timeout=120, trust_env=False) as up:
                             with open(output_path, "rb") as f:
                                 r = await up.post(
                                     f"{api_url}/api/complete/{job_id}",

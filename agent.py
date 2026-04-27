@@ -104,33 +104,34 @@ async def submit(page: Page) -> None:
 
 async def wait_for_generation(page: Page, timeout_ms: int) -> None:
     log.info("Жду результат до %d сек…", timeout_ms // 1000)
-    # Кнопка "👍 хорошее изображение" появляется только когда картинка готова
-    try:
-        await page.wait_for_selector(
-            GENERATED_READY_SELECTOR, state="visible", timeout=timeout_ms
-        )
-    except Exception:
-        # Grace-period 30 сек: ChatGPT мог закончить буквально только что,
-        # не бросаем задачу из-за нескольких лишних секунд генерации.
-        log.warning("Основной таймаут истёк — жду ещё 30 сек (grace period)…")
-        await page.wait_for_selector(
-            GENERATED_READY_SELECTOR, state="visible", timeout=30000
-        )
-    log.info("Картинка готова, ждём полной загрузки пикселей…")
-    # Дополнительно — дождаться img.complete && naturalWidth > 1000
-    for _ in range(40):
+
+    # Ждём появления сгенерированного изображения с шагом 2 сек.
+    # Ищем крупное изображение (>400px) в последнем сообщении ассистента.
+    # Не зависим от alt-текста — ChatGPT меняет его между версиями UI.
+    deadline_ms = timeout_ms + 30_000  # +30 сек grace period
+    elapsed = 0
+    while elapsed < deadline_ms:
         ready = await page.evaluate(
             """() => {
-                const imgs = [...document.querySelectorAll('img')];
-                const cand = imgs.filter(im => /^Сформированное|^Generated/.test(im.alt) && im.naturalWidth > 1000);
-                if (!cand.length) return false;
-                return cand.every(im => im.complete);
+                const msgs = [...document.querySelectorAll('[data-message-author-role="assistant"]')];
+                if (!msgs.length) return false;
+                const last = msgs[msgs.length - 1];
+                const imgs = [...last.querySelectorAll('img')].filter(
+                    im => im.naturalWidth > 400 && im.complete
+                );
+                return imgs.length > 0;
             }"""
         )
         if ready:
+            log.info("Картинка готова, ждём полной загрузки пикселей…")
             await asyncio.sleep(1)
             return
-        await asyncio.sleep(0.5)
+        if elapsed % 30000 == 0 and elapsed > 0:
+            log.info("Ещё жду… %d сек", elapsed // 1000)
+        await asyncio.sleep(2)
+        elapsed += 2000
+
+    raise RuntimeError(f"Изображение не появилось за {deadline_ms // 1000} сек")
 
 
 async def download_via_anchor(page: Page, output_path: Path) -> None:
@@ -138,8 +139,9 @@ async def download_via_anchor(page: Page, output_path: Path) -> None:
     log.info("Готовлю blob и якорь для скачивания…")
     prepared = await page.evaluate(
         """async () => {
-            const imgs = [...document.querySelectorAll('img')];
-            const cand = imgs.filter(im => /^Сформированное|^Generated/.test(im.alt) && im.naturalWidth > 1000);
+            const msgs = [...document.querySelectorAll('[data-message-author-role="assistant"]')];
+            const last = msgs.length ? msgs[msgs.length - 1] : document;
+            const cand = [...last.querySelectorAll('img')].filter(im => im.naturalWidth > 400 && im.complete);
             const img = cand[cand.length - 1];
             if (!img) return {ok: false, error: 'no img'};
             try {

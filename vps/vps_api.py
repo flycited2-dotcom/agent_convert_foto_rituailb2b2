@@ -16,7 +16,7 @@ from datetime import datetime
 from pathlib import Path
 
 from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import JSONResponse, Response
 
 from config_vps import API_TOKEN, DB_PATH, FAILED_DIR, INPUT_DIR, OUTPUT_DIR, PROCESSED_DIR
 
@@ -72,7 +72,6 @@ def get_input(job_id: int, x_agent_token: str = Header(...)):
         raise HTTPException(status_code=404, detail="Input file not found")
     # FileResponse вызывал RuntimeError "Response content longer than Content-Length"
     # Читаем файл в память и отдаём как Response — надёжнее
-    from fastapi.responses import Response
     data = path.read_bytes()
     return Response(
         content=data,
