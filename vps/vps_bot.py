@@ -14,10 +14,17 @@ import asyncio
 import logging
 import shutil
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Update
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputFile,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+    Update,
+)
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -95,6 +102,29 @@ def _allowed(user_id: int | None) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Reply-клавиатура: 3 кнопки быстрого доступа, всегда внизу экрана
+# ---------------------------------------------------------------------------
+
+BTN_STATUS  = "📊 Статус"
+BTN_CLEAR   = "❌ Очистить очередь"
+BTN_RESTART = "♻️ Рестарт зависших"
+
+MAIN_KEYBOARD = ReplyKeyboardMarkup(
+    [
+        [KeyboardButton(BTN_STATUS)],
+        [KeyboardButton(BTN_CLEAR), KeyboardButton(BTN_RESTART)],
+    ],
+    resize_keyboard=True,
+    is_persistent=True,
+)
+
+
+def _pending_count() -> int:
+    with db_conn() as conn:
+        return conn.execute("SELECT COUNT(*) FROM jobs WHERE status='pending'").fetchone()[0]
+
+
+# ---------------------------------------------------------------------------
 # Handlers
 # ---------------------------------------------------------------------------
 
@@ -104,7 +134,11 @@ async def cmd_start(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         return
     await update.message.reply_text(
         "Привет! Пришли мне фото товара (как фото или документ) — обработаю в карточку.\n\n"
-        "Команды:\n/status — состояние очереди\n/help — это сообщение"
+        "Кнопки внизу экрана:\n"
+        f"  {BTN_STATUS} — счётчик очереди\n"
+        f"  {BTN_CLEAR} — снять все ожидающие задачи\n"
+        f"  {BTN_RESTART} — пере-запустить зависшие (processing >5 мин)",
+        reply_markup=MAIN_KEYBOARD,
     )
 
 
@@ -119,11 +153,69 @@ async def cmd_status(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         pending    = conn.execute("SELECT COUNT(*) FROM jobs WHERE status='pending'").fetchone()[0]
         processing = conn.execute("SELECT COUNT(*) FROM jobs WHERE status='processing'").fetchone()[0]
         done       = conn.execute("SELECT COUNT(*) FROM jobs WHERE status='done'").fetchone()[0]
+        cancelled  = conn.execute("SELECT COUNT(*) FROM jobs WHERE status='cancelled'").fetchone()[0]
     await update.message.reply_text(
         f"В очереди:       {pending}\n"
         f"Обрабатывается:  {processing}\n"
-        f"Готово всего:    {done}"
+        f"Готово всего:    {done}\n"
+        f"Отменено:        {cancelled}",
+        reply_markup=MAIN_KEYBOARD,
     )
+
+
+async def cmd_clear_queue(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    """Снимаем все pending задачи (помечаем cancelled). Текущую processing
+    не трогаем — она доживёт до конца, а её результат всё равно ждут."""
+    if not update.effective_user or not _allowed(update.effective_user.id):
+        return
+    now_iso = datetime.now().isoformat()
+    with db_conn() as conn:
+        cur = conn.execute(
+            "UPDATE jobs SET status='cancelled', updated_at=? WHERE status='pending'",
+            (now_iso,),
+        )
+        n = cur.rowcount
+        conn.commit()
+    await update.message.reply_text(
+        f"❌ Очередь очищена. Снято: {n}.\n"
+        "(Если что-то сейчас обрабатывается — оно доживёт до конца.)",
+        reply_markup=MAIN_KEYBOARD,
+    )
+
+
+async def cmd_restart_stuck(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    """Возвращаем processing-задачи старше 5 мин обратно в pending —
+    агент подхватит их при следующем опросе."""
+    if not update.effective_user or not _allowed(update.effective_user.id):
+        return
+    now = datetime.now()
+    cutoff = (now - timedelta(minutes=5)).isoformat()
+    with db_conn() as conn:
+        cur = conn.execute(
+            "UPDATE jobs SET status='pending', updated_at=? "
+            "WHERE status='processing' AND updated_at < ?",
+            (now.isoformat(), cutoff),
+        )
+        n = cur.rowcount
+        conn.commit()
+    await update.message.reply_text(
+        f"♻️ Сброшено зависших: {n}.\n"
+        f"В очереди сейчас: {_pending_count()}.",
+        reply_markup=MAIN_KEYBOARD,
+    )
+
+
+async def on_keyboard_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Обработчик нажатий reply-клавиатуры (приходят как обычные текстовые сообщения)."""
+    if not update.message or not update.message.text:
+        return
+    text = update.message.text.strip()
+    if text == BTN_STATUS:
+        await cmd_status(update, ctx)
+    elif text == BTN_CLEAR:
+        await cmd_clear_queue(update, ctx)
+    elif text == BTN_RESTART:
+        await cmd_restart_stuck(update, ctx)
 
 
 async def handle_photo(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
@@ -175,13 +267,30 @@ async def on_callback(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     data = q.data or ""
     await q.answer()
 
-    if data.startswith("redo:"):
-        archived_name = data[len("redo:"):]
+    # callback_data компактный: "<action>:<job_id>" — гарантированно <64 байт.
+    # Имена файлов читаем из БД по job_id (Telegram limit на callback_data = 64).
+    try:
+        action, _, job_id_str = data.partition(":")
+        job_id = int(job_id_str)
+    except ValueError:
+        await q.message.reply_text(f"Неизвестный callback: {data}")
+        return
+
+    with db_conn() as conn:
+        row = conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+    if not row:
+        await q.message.reply_text(f"Задача #{job_id} не найдена в БД.")
+        return
+
+    if action == "redo":
+        archived_name = row["archived_filename"]
+        if not archived_name:
+            await q.message.reply_text("⚠️ У этой задачи нет исходника в processed/.")
+            return
         src = PROCESSED_DIR / archived_name
         if not src.exists():
             await q.message.reply_text(
-                f"⚠️ Исходник «{archived_name}» не найден в processed/. "
-                "Пришли фото заново."
+                f"⚠️ Исходник «{archived_name}» не найден в processed/. Пришли фото заново."
             )
             return
         ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
@@ -193,13 +302,16 @@ async def on_callback(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
                 (q.message.chat_id, new_filename),
             )
             conn.commit()
-        with db_conn() as conn:
-            pending = conn.execute("SELECT COUNT(*) FROM jobs WHERE status='pending'").fetchone()[0]
-        await q.message.reply_text(f"♻️ Поставил на повторную генерацию. В очереди: {pending}.")
+        await q.message.reply_text(
+            f"♻️ Поставил на повторную генерацию. В очереди: {_pending_count()}."
+        )
         return
 
-    if data.startswith("retry_failed:"):
-        failed_name = data[len("retry_failed:"):]
+    if action == "retry":
+        failed_name = row["failed_filename"]
+        if not failed_name:
+            await q.message.reply_text("⚠️ У этой задачи нет исходника в failed/.")
+            return
         src = FAILED_DIR / failed_name
         if not src.exists():
             await q.message.reply_text(
@@ -215,13 +327,16 @@ async def on_callback(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
                 (q.message.chat_id, new_filename),
             )
             conn.commit()
-        with db_conn() as conn:
-            pending = conn.execute("SELECT COUNT(*) FROM jobs WHERE status='pending'").fetchone()[0]
-        await q.message.reply_text(f"🔄 Поставил на повтор. В очереди: {pending}.")
+        await q.message.reply_text(
+            f"🔄 Поставил на повтор. В очереди: {_pending_count()}."
+        )
         return
 
-    if data.startswith("bad:"):
-        bad_name = data[len("bad:"):]
+    if action == "bad":
+        bad_name = row["output_filename"]
+        if not bad_name:
+            await q.message.reply_text("⚠️ У этой задачи нет output_filename.")
+            return
         src = OUTPUT_DIR / bad_name
         if not src.exists():
             await q.message.reply_text(f"Файл «{bad_name}» уже не в output/.")
@@ -265,18 +380,23 @@ async def result_sender(app: Application) -> None:
                     keyboard = InlineKeyboardMarkup([
                         [InlineKeyboardButton(
                             "🔄 Перегенерировать",
-                            callback_data=f"redo:{row['archived_filename']}",
+                            callback_data=f"redo:{row['id']}",
                         )],
                         [InlineKeyboardButton(
                             "🗑 Удалить (плохой)",
-                            callback_data=f"bad:{row['output_filename']}",
+                            callback_data=f"bad:{row['id']}",
                         )],
                     ])
+                    pending_now = _pending_count()
+                    caption = (
+                        f"✅ Готово: {row['output_filename']}\n"
+                        f"В очереди: {pending_now}"
+                    )
                     with open(out_path, "rb") as f:
                         await app.bot.send_document(
                             chat_id=row["chat_id"],
                             document=InputFile(f, filename=row["output_filename"]),
-                            caption=f"✅ Готово: {row['output_filename']}",
+                            caption=caption,
                             reply_markup=keyboard,
                         )
                     with db_conn() as conn:
@@ -294,7 +414,7 @@ async def result_sender(app: Application) -> None:
                         keyboard = InlineKeyboardMarkup([[
                             InlineKeyboardButton(
                                 "🔄 Повторить",
-                                callback_data=f"retry_failed:{row['failed_filename']}",
+                                callback_data=f"retry:{row['id']}",
                             )
                         ]])
                     await app.bot.send_message(
@@ -341,8 +461,15 @@ def main() -> None:
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("clear", cmd_clear_queue))
+    app.add_handler(CommandHandler("restart_stuck", cmd_restart_stuck))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.Document.IMAGE, handle_photo))
+    # Reply-клавиатура шлёт обычный текст — ловим точные совпадения с подписями кнопок
+    app.add_handler(MessageHandler(
+        filters.TEXT & filters.Regex(f"^({BTN_STATUS}|{BTN_CLEAR}|{BTN_RESTART})$"),
+        on_keyboard_text,
+    ))
     app.add_handler(CallbackQueryHandler(on_callback))
 
     log.info("VPS-бот запущен.")
