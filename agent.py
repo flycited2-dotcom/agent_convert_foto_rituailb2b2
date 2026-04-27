@@ -21,7 +21,6 @@ from config import (
     LOGS_DIR,
     OUTPUT_DIR,
     PROCESSED_DIR,
-    PROJECT_PROMPT,
     PROMPT_TEMPLATE,
     REFERENCE_FILES,
 )
@@ -204,19 +203,9 @@ def archive_input(file_path: Path) -> Path:
 
 async def process_one_file(file_path: Path) -> Path:
     output_path = make_output_path()
-
-    if CHATGPT_PROJECT_URL:
-        # Режим проекта: эталоны уже в ChatGPT-проекте, загружаем только фото товара
-        log.info("=== [ПРОЕКТ] Обработка: %s → %s ===", file_path.name, output_path.name)
-        chat_url = CHATGPT_PROJECT_URL
-        prompt = PROJECT_PROMPT
-        refs = []
-    else:
-        # Обычный режим: загружаем 2 эталона + фото + полный промпт
-        log.info("=== Обработка: %s → %s ===", file_path.name, output_path.name)
-        chat_url = "https://chatgpt.com/"
-        prompt = PROMPT_TEMPLATE
-        refs = REFERENCE_FILES
+    # Открываем чат в проекте если задан URL, иначе обычный chatgpt.com
+    chat_url = CHATGPT_PROJECT_URL or "https://chatgpt.com/"
+    log.info("=== Обработка: %s → %s (url: %s) ===", file_path.name, output_path.name, chat_url)
 
     async with async_playwright() as p:
         browser = await p.chromium.connect_over_cdp(CHROME_CDP_URL)
@@ -224,13 +213,13 @@ async def process_one_file(file_path: Path) -> Path:
             page = await find_or_open_chatgpt(browser)
             await open_new_chat(page, url=chat_url)
 
-            for ref in refs:
+            for ref in REFERENCE_FILES:
                 if not ref.exists():
                     raise FileNotFoundError(f"Эталон не найден: {ref}")
                 await paste_image(page, ref)
 
             await paste_image(page, file_path, settle_seconds=5.0)
-            await paste_text(page, prompt)
+            await paste_text(page, PROMPT_TEMPLATE)
             await submit(page)
 
             await wait_for_generation(page, GENERATION_TIMEOUT_SEC * 1000)

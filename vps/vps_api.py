@@ -70,7 +70,15 @@ def get_input(job_id: int, x_agent_token: str = Header(...)):
     path = INPUT_DIR / row["input_filename"]
     if not path.exists():
         raise HTTPException(status_code=404, detail="Input file not found")
-    return FileResponse(str(path), filename=row["input_filename"])
+    # FileResponse вызывал RuntimeError "Response content longer than Content-Length"
+    # Читаем файл в память и отдаём как Response — надёжнее
+    from fastapi.responses import Response
+    data = path.read_bytes()
+    return Response(
+        content=data,
+        media_type="application/octet-stream",
+        headers={"Content-Disposition": f'attachment; filename="{row["input_filename"]}"'},
+    )
 
 
 @app.post("/api/complete/{job_id}")

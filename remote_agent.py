@@ -24,8 +24,23 @@ from dotenv import load_dotenv
 ROOT = Path(__file__).resolve().parent
 load_dotenv(ROOT / ".env")
 
-from config import DELAY_BETWEEN_JOBS_SEC, LOGS_DIR
-from agent import process_one_file
+# Логирование настраиваем ДО импорта agent.py — иначе agent.basicConfig
+# перехватит все логи в agent.log. force=True перебивает любой предыдущий конфиг.
+_LOGS_DIR = ROOT / os.getenv("LOGS_DIR", "logs")
+_LOGS_DIR.mkdir(parents=True, exist_ok=True)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[
+        logging.FileHandler(_LOGS_DIR / "remote_agent.log", encoding="utf-8"),
+        logging.StreamHandler(),
+    ],
+    force=True,
+)
+log = logging.getLogger("remote_agent")
+
+from config import DELAY_BETWEEN_JOBS_SEC, LOGS_DIR  # noqa: E402
+from agent import process_one_file  # noqa: E402
 
 # --- SSH / API config (из .env) ---
 VPS_SSH_HOST  = os.getenv("VPS_SSH_HOST", "186.246.44.204")
@@ -34,16 +49,6 @@ VPS_SSH_PASS  = os.getenv("VPS_SSH_PASS", "")
 VPS_API_PORT  = int(os.getenv("VPS_API_PORT", "8765"))
 VPS_API_TOKEN = os.getenv("VPS_API_TOKEN", "")
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL_SEC", "10"))
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[
-        logging.FileHandler(LOGS_DIR / "remote_agent.log", encoding="utf-8"),
-        logging.StreamHandler(),
-    ],
-)
-log = logging.getLogger("remote_agent")
 
 
 # ---------------------------------------------------------------------------
