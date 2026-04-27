@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import sys
 from datetime import datetime
@@ -36,9 +37,36 @@ logging.basicConfig(
 log = logging.getLogger("agent")
 
 
-GENERATED_READY_SELECTOR = 'button[data-testid="good-image-turn-action-button"]'
-GENERATED_IMG_SELECTOR = 'img[alt^="Сформированное"], img[alt^="Generated"]'
 COMPOSER_SELECTOR = 'div[contenteditable="true"]'
+
+# JS-функция: возвращает <img> сгенерированной картинки в последнем сообщении
+# ассистента, либо null. Три способа поиска (защита от смены DOM в ChatGPT):
+#   1) <img> внутри последнего [data-message-author-role="assistant"] (или
+#      data-author-role) с naturalWidth > 600 и complete=true
+#   2) <img> чей src содержит признак сгенерированной картинки OpenAI
+#      (oaiusercontent / dalle / sediment)
+#   3) Самая большая картинка на странице, если их хотя бы 4
+#      (2 эталона + наш input + сгенерированная)
+FIND_GENERATED_IMG_JS = """
+    () => {
+        const all = [...document.querySelectorAll('img')]
+            .filter(im => im.complete && im.naturalWidth > 600);
+        const msgs = [...document.querySelectorAll(
+            '[data-message-author-role=\\"assistant\\"], [data-author-role=\\"assistant\\"]'
+        )];
+        if (msgs.length) {
+            const inLast = [...msgs[msgs.length - 1].querySelectorAll('img')]
+                .filter(im => im.complete && im.naturalWidth > 600);
+            if (inLast.length) return inLast[inLast.length - 1];
+        }
+        const gen = all.filter(im => /oaiusercontent|\\/dalle\\/|sediment/.test(im.src || ''));
+        if (gen.length) return gen[gen.length - 1];
+        if (all.length >= 4) {
+            return all.slice().sort((a, b) => b.naturalWidth - a.naturalWidth)[0];
+        }
+        return null;
+    }
+"""
 
 
 async def find_or_open_chatgpt(browser: Browser) -> Page:
@@ -102,47 +130,72 @@ async def submit(page: Page) -> None:
     log.info("Submit нажат")
 
 
+async def _dump_page_state(page: Page, tag: str) -> None:
+    """Сохранить screenshot + список <img> при таймауте — для ручной отладки."""
+    try:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        base = LOGS_DIR / f"timeout_{tag}_{ts}"
+        await page.screenshot(path=str(base.with_suffix(".png")), full_page=True)
+        info = await page.evaluate(
+            """() => [...document.querySelectorAll('img')].map(im => ({
+                src: (im.src || '').slice(0, 150),
+                alt: im.alt,
+                w: im.naturalWidth,
+                h: im.naturalHeight,
+                complete: im.complete,
+                visible: im.offsetWidth > 0,
+                parentRole: (im.closest('[data-message-author-role], [data-author-role]') || {}).getAttribute
+                    ? (im.closest('[data-message-author-role], [data-author-role]')
+                        .getAttribute('data-message-author-role')
+                        || im.closest('[data-message-author-role], [data-author-role]')
+                            .getAttribute('data-author-role'))
+                    : null
+            }))"""
+        )
+        base.with_suffix(".json").write_text(
+            json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        log.error("Дамп сохранён: %s.png + .json", base)
+    except Exception as de:
+        log.warning("Не удалось сохранить дамп: %s", de)
+
+
 async def wait_for_generation(page: Page, timeout_ms: int) -> None:
     log.info("Жду результат до %d сек…", timeout_ms // 1000)
 
-    # Ждём появления сгенерированного изображения с шагом 2 сек.
-    # Ищем крупное изображение (>400px) в последнем сообщении ассистента.
-    # Не зависим от alt-текста — ChatGPT меняет его между версиями UI.
+    # Ждём картинку через FIND_GENERATED_IMG_JS (3 способа поиска).
+    # Шаг 2 сек, лог раз в 30 сек.
     deadline_ms = timeout_ms + 30_000  # +30 сек grace period
     elapsed = 0
+    check_js = f"() => !!({FIND_GENERATED_IMG_JS.strip()})()"
     while elapsed < deadline_ms:
-        ready = await page.evaluate(
-            """() => {
-                const msgs = [...document.querySelectorAll('[data-message-author-role="assistant"]')];
-                if (!msgs.length) return false;
-                const last = msgs[msgs.length - 1];
-                const imgs = [...last.querySelectorAll('img')].filter(
-                    im => im.naturalWidth > 400 && im.complete
-                );
-                return imgs.length > 0;
-            }"""
-        )
+        try:
+            ready = await page.evaluate(check_js)
+        except Exception as e:
+            log.warning("Ошибка JS-проверки готовности: %s", e)
+            ready = False
         if ready:
             log.info("Картинка готова, ждём полной загрузки пикселей…")
             await asyncio.sleep(1)
             return
-        if elapsed % 30000 == 0 and elapsed > 0:
+        if elapsed > 0 and elapsed % 30000 == 0:
             log.info("Ещё жду… %d сек", elapsed // 1000)
         await asyncio.sleep(2)
         elapsed += 2000
 
+    await _dump_page_state(page, "wait_gen")
     raise RuntimeError(f"Изображение не появилось за {deadline_ms // 1000} сек")
 
 
 async def download_via_anchor(page: Page, output_path: Path) -> None:
     """Качаем картинку через blob URL + временный <a download>, кликнутый Playwright'ом."""
     log.info("Готовлю blob и якорь для скачивания…")
+    # Используем тот же FIND_GENERATED_IMG_JS, что и в wait_for_generation —
+    # гарантия что качаем именно ту картинку, которую посчитали готовой.
     prepared = await page.evaluate(
         """async () => {
-            const msgs = [...document.querySelectorAll('[data-message-author-role="assistant"]')];
-            const last = msgs.length ? msgs[msgs.length - 1] : document;
-            const cand = [...last.querySelectorAll('img')].filter(im => im.naturalWidth > 400 && im.complete);
-            const img = cand[cand.length - 1];
+            const findImg = """ + FIND_GENERATED_IMG_JS.strip() + """;
+            const img = findImg();
             if (!img) return {ok: false, error: 'no img'};
             try {
                 const r = await fetch(img.src);
