@@ -15,11 +15,13 @@ from playwright.async_api import Browser, Page, async_playwright
 
 from clipboard_utils import copy_image_to_clipboard, copy_text_to_clipboard
 from config import (
+    CHATGPT_PROJECT_URL,
     CHROME_CDP_URL,
     GENERATION_TIMEOUT_SEC,
     LOGS_DIR,
     OUTPUT_DIR,
     PROCESSED_DIR,
+    PROJECT_PROMPT,
     PROMPT_TEMPLATE,
     REFERENCE_FILES,
 )
@@ -51,8 +53,8 @@ async def find_or_open_chatgpt(browser: Browser) -> Page:
     return page
 
 
-async def open_new_chat(page: Page) -> None:
-    await page.goto("https://chatgpt.com/", wait_until="domcontentloaded")
+async def open_new_chat(page: Page, url: str = "https://chatgpt.com/") -> None:
+    await page.goto(url, wait_until="domcontentloaded")
     await page.wait_for_selector(COMPOSER_SELECTOR, timeout=20000)
     await asyncio.sleep(1)
 
@@ -202,21 +204,33 @@ def archive_input(file_path: Path) -> Path:
 
 async def process_one_file(file_path: Path) -> Path:
     output_path = make_output_path()
-    log.info("=== Обработка: %s → %s ===", file_path.name, output_path.name)
+
+    if CHATGPT_PROJECT_URL:
+        # Режим проекта: эталоны уже в ChatGPT-проекте, загружаем только фото товара
+        log.info("=== [ПРОЕКТ] Обработка: %s → %s ===", file_path.name, output_path.name)
+        chat_url = CHATGPT_PROJECT_URL
+        prompt = PROJECT_PROMPT
+        refs = []
+    else:
+        # Обычный режим: загружаем 2 эталона + фото + полный промпт
+        log.info("=== Обработка: %s → %s ===", file_path.name, output_path.name)
+        chat_url = "https://chatgpt.com/"
+        prompt = PROMPT_TEMPLATE
+        refs = REFERENCE_FILES
 
     async with async_playwright() as p:
         browser = await p.chromium.connect_over_cdp(CHROME_CDP_URL)
         try:
             page = await find_or_open_chatgpt(browser)
-            await open_new_chat(page)
+            await open_new_chat(page, url=chat_url)
 
-            for ref in REFERENCE_FILES:
+            for ref in refs:
                 if not ref.exists():
                     raise FileNotFoundError(f"Эталон не найден: {ref}")
                 await paste_image(page, ref)
 
             await paste_image(page, file_path, settle_seconds=5.0)
-            await paste_text(page, PROMPT_TEMPLATE)
+            await paste_text(page, prompt)
             await submit(page)
 
             await wait_for_generation(page, GENERATION_TIMEOUT_SEC * 1000)

@@ -18,6 +18,14 @@ TELEGRAM_ALLOWED_USER_ID = int(os.getenv("TELEGRAM_ALLOWED_USER_ID", "0") or 0)
 
 CHROME_CDP_URL = os.getenv("CHROME_CDP_URL", "http://127.0.0.1:9333").strip()
 
+# URL проекта ChatGPT. Если задан — агент работает в режиме проекта:
+# загружает только фото товара (эталоны уже в проекте), быстрее и надёжнее.
+# Оставь пустым для работы в обычном режиме (3 файла + полный промпт).
+CHATGPT_PROJECT_URL = os.getenv("CHATGPT_PROJECT_URL", "").strip()
+
+# Короткое сообщение в режиме проекта (инструкции уже в настройках проекта)
+PROJECT_PROMPT = os.getenv("PROJECT_PROMPT", "Вот фото товара. Сгенерируй карточку.")
+
 INPUT_DIR = _path("INPUT_DIR", "input")
 OUTPUT_DIR = _path("OUTPUT_DIR", "output")
 PROCESSED_DIR = _path("PROCESSED_DIR", "processed")
