@@ -39,34 +39,48 @@ log = logging.getLogger("agent")
 
 COMPOSER_SELECTOR = 'div[contenteditable="true"]'
 
-# JS-функция: возвращает <img> сгенерированной картинки в последнем сообщении
-# ассистента, либо null. Три способа поиска (защита от смены DOM в ChatGPT):
+# JS: возвращает <img> сгенерированной картинки, src которой ОТСУТСТВУЕТ в
+# baselineList (картинки, которые были на странице ДО нашего submit).
+# Это защищает от того, что ChatGPT-проект переоткрывает старый чат с уже
+# готовой картинкой — мы её не пропускаем как "свежую".
+#
+# Три стратегии поиска (защита от смены DOM):
 #   1) <img> внутри последнего [data-message-author-role="assistant"] (или
 #      data-author-role) с naturalWidth > 600 и complete=true
 #   2) <img> чей src содержит признак сгенерированной картинки OpenAI
 #      (oaiusercontent / dalle / sediment)
-#   3) Самая большая картинка на странице, если их хотя бы 4
-#      (2 эталона + наш input + сгенерированная)
+#   3) Самая большая картинка на странице (только если их ≥ 4 = эталоны+input+gen)
 FIND_GENERATED_IMG_JS = """
-    () => {
+    (baselineList) => {
+        const baseline = new Set(baselineList || []);
+        const isFresh = im => im.src && !baseline.has(im.src);
+
         const all = [...document.querySelectorAll('img')]
-            .filter(im => im.complete && im.naturalWidth > 600);
+            .filter(im => im.complete && im.naturalWidth > 600 && isFresh(im));
+
         const msgs = [...document.querySelectorAll(
             '[data-message-author-role=\\"assistant\\"], [data-author-role=\\"assistant\\"]'
         )];
         if (msgs.length) {
             const inLast = [...msgs[msgs.length - 1].querySelectorAll('img')]
-                .filter(im => im.complete && im.naturalWidth > 600);
+                .filter(im => im.complete && im.naturalWidth > 600 && isFresh(im));
             if (inLast.length) return inLast[inLast.length - 1];
         }
         const gen = all.filter(im => /oaiusercontent|\\/dalle\\/|sediment/.test(im.src || ''));
         if (gen.length) return gen[gen.length - 1];
-        if (all.length >= 4) {
+        if (all.length >= 1) {
             return all.slice().sort((a, b) => b.naturalWidth - a.naturalWidth)[0];
         }
         return null;
     }
 """
+
+
+async def snapshot_image_srcs(page: Page) -> list[str]:
+    """Снимок всех src картинок на странице — чтобы потом отфильтровать новую."""
+    return await page.evaluate(
+        "() => [...document.querySelectorAll('img')].map(im => im.src).filter(Boolean)"
+    )
 
 
 async def find_or_open_chatgpt(browser: Browser) -> Page:
@@ -160,17 +174,21 @@ async def _dump_page_state(page: Page, tag: str) -> None:
         log.warning("Не удалось сохранить дамп: %s", de)
 
 
-async def wait_for_generation(page: Page, timeout_ms: int) -> None:
-    log.info("Жду результат до %d сек…", timeout_ms // 1000)
+async def wait_for_generation(
+    page: Page, timeout_ms: int, baseline_srcs: list[str]
+) -> None:
+    log.info(
+        "Жду результат до %d сек… (baseline: %d картинок)",
+        timeout_ms // 1000, len(baseline_srcs),
+    )
 
-    # Ждём картинку через FIND_GENERATED_IMG_JS (3 способа поиска).
-    # Шаг 2 сек, лог раз в 30 сек.
     deadline_ms = timeout_ms + 30_000  # +30 сек grace period
     elapsed = 0
-    check_js = f"() => !!({FIND_GENERATED_IMG_JS.strip()})()"
+    # Передаём baseline через arg page.evaluate(js, arg) — иначе JSON.escape для CSS
+    check_js = f"(baseline) => !!({FIND_GENERATED_IMG_JS.strip()})(baseline)"
     while elapsed < deadline_ms:
         try:
-            ready = await page.evaluate(check_js)
+            ready = await page.evaluate(check_js, baseline_srcs)
         except Exception as e:
             log.warning("Ошибка JS-проверки готовности: %s", e)
             ready = False
@@ -187,15 +205,21 @@ async def wait_for_generation(page: Page, timeout_ms: int) -> None:
     raise RuntimeError(f"Изображение не появилось за {deadline_ms // 1000} сек")
 
 
-async def download_via_anchor(page: Page, output_path: Path) -> None:
-    """Качаем картинку через blob URL + временный <a download>, кликнутый Playwright'ом."""
+async def download_via_anchor(
+    page: Page, output_path: Path, baseline_srcs: list[str]
+) -> None:
+    """Качаем картинку через blob URL + временный <a download>, кликнутый Playwright'ом.
+
+    baseline_srcs — список src которые БЫЛИ на странице до submit; их игнорируем,
+    качаем только новую.
+    """
     log.info("Готовлю blob и якорь для скачивания…")
-    # Используем тот же FIND_GENERATED_IMG_JS, что и в wait_for_generation —
-    # гарантия что качаем именно ту картинку, которую посчитали готовой.
+    # Используем тот же FIND_GENERATED_IMG_JS — гарантия что качаем именно ту,
+    # которую посчитали готовой, и не старую "застрявшую" из предыдущего чата.
     prepared = await page.evaluate(
-        """async () => {
+        """async (baseline) => {
             const findImg = """ + FIND_GENERATED_IMG_JS.strip() + """;
-            const img = findImg();
+            const img = findImg(baseline);
             if (!img) return {ok: false, error: 'no img'};
             try {
                 const r = await fetch(img.src);
@@ -216,7 +240,8 @@ async def download_via_anchor(page: Page, output_path: Path) -> None:
             } catch (e) {
                 return {ok: false, error: String(e)};
             }
-        }"""
+        }""",
+        baseline_srcs,
     )
     if not prepared.get("ok"):
         raise RuntimeError(f"Не удалось подготовить blob: {prepared.get('error')}")
@@ -275,10 +300,18 @@ async def process_one_file(file_path: Path) -> Path:
 
             await paste_image(page, file_path, settle_seconds=5.0)
             await paste_text(page, PROMPT_TEMPLATE)
+
+            # Снимаем baseline ВСЕХ src картинок ДО submit — потом считаем
+            # готовой только ту картинку, которой не было в baseline.
+            # Это защищает от ситуации когда ChatGPT-проект переоткрывает
+            # старый чат с уже готовой картинкой с прошлой задачи.
+            baseline_srcs = await snapshot_image_srcs(page)
+            log.info("Baseline картинок до submit: %d", len(baseline_srcs))
+
             await submit(page)
 
-            await wait_for_generation(page, GENERATION_TIMEOUT_SEC * 1000)
-            await download_via_anchor(page, output_path)
+            await wait_for_generation(page, GENERATION_TIMEOUT_SEC * 1000, baseline_srcs)
+            await download_via_anchor(page, output_path, baseline_srcs)
         finally:
             await browser.close()  # для CDP это disconnect, не убивает Chrome
 

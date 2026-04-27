@@ -34,9 +34,18 @@ def upload_file(file_path: Path, folder_id: str, credentials_json: str) -> str:
     service = build("drive", "v3", credentials=creds, cache_discovery=False)
     meta = {"name": file_path.name, "parents": [folder_id]}
     media = MediaFileUpload(str(file_path), mimetype="image/png", resumable=False)
-    f = (
-        service.files()
-        .create(body=meta, media_body=media, fields="id,webViewLink")
-        .execute()
-    )
-    return f["webViewLink"]
+    try:
+        f = (
+            service.files()
+            .create(body=meta, media_body=media, fields="id,webViewLink")
+            .execute()
+        )
+        return f["webViewLink"]
+    finally:
+        # MediaFileUpload не закрывает файл сам — на Windows это блокирует
+        # последующий unlink(). Закрываем дескриптор явно.
+        try:
+            if media._fd is not None:
+                media._fd.close()
+        except Exception:
+            pass
