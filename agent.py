@@ -41,26 +41,48 @@ COMPOSER_SELECTOR = 'div[contenteditable="true"]'
 
 # JS: возвращает <img> СГЕНЕРИРОВАННОЙ картинки.
 #
-# Жёсткое условие: картинка ДОЛЖНА быть внутри сообщения с ролью assistant.
-# Никакие альтернативные стратегии (по src-паттерну, "самая большая на странице")
-# не используются — они ловят пользовательский input (загруженные ChatGPT'ом
-# фото лежат в src oaiusercontent.com и проходили regex-стратегию).
+# baselineList — src которые БЫЛИ на странице после submit+5s settle.
+# Все user-фото к этому моменту уже имеют финальные URL и попадают сюда.
 #
-# baselineList — src которые БЫЛИ на странице до submit (включая старые
-# assistant-картинки из переоткрытого чата проекта). Их игнорируем.
+# Стратегия 1 (приоритет): картинка внутри последнего assistant-message.
+#   Селекторы: [data-message-author-role="assistant"], [data-author-role="assistant"],
+#   [data-testid^="conversation-turn-"][data-turn="assistant"].
+#
+# Стратегия 2 (fallback, если разметка assistant-role изменилась):
+#   Любая крупная свежая картинка, которая НЕ внутри role="user" контейнера.
+#   Это защищает от input-фото (они физически в role="user").
 FIND_GENERATED_IMG_JS = """
     (baselineList) => {
         const baseline = new Set(baselineList || []);
-        const msgs = [...document.querySelectorAll(
-            '[data-message-author-role=\\"assistant\\"], [data-author-role=\\"assistant\\"]'
-        )];
-        if (!msgs.length) return null;
-        const last = msgs[msgs.length - 1];
-        const cand = [...last.querySelectorAll('img')].filter(
-            im => im.complete && im.naturalWidth > 600
-                  && im.src && !baseline.has(im.src)
-        );
-        return cand.length ? cand[cand.length - 1] : null;
+        const isFresh = im => im.complete && im.naturalWidth > 600
+                              && im.src && !baseline.has(im.src);
+
+        // Стратегия 1: assistant role
+        const aSelector = [
+            '[data-message-author-role=\\"assistant\\"]',
+            '[data-author-role=\\"assistant\\"]'
+        ].join(', ');
+        const aMsgs = [...document.querySelectorAll(aSelector)];
+        if (aMsgs.length) {
+            const last = aMsgs[aMsgs.length - 1];
+            const cand = [...last.querySelectorAll('img')].filter(isFresh);
+            if (cand.length) return cand[cand.length - 1];
+        }
+
+        // Стратегия 2 (fallback): крупная свежая картинка ВНЕ user-сообщений
+        const uSelector = [
+            '[data-message-author-role=\\"user\\"]',
+            '[data-author-role=\\"user\\"]'
+        ].join(', ');
+        const uMsgs = [...document.querySelectorAll(uSelector)];
+        const inUser = im => uMsgs.some(m => m.contains(im));
+
+        const all = [...document.querySelectorAll('img')]
+            .filter(im => isFresh(im) && !inUser(im));
+        if (all.length) {
+            return all.sort((a, b) => b.naturalWidth - a.naturalWidth)[0];
+        }
+        return null;
     }
 """
 
