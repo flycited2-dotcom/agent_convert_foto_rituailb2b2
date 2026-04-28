@@ -39,39 +39,28 @@ log = logging.getLogger("agent")
 
 COMPOSER_SELECTOR = 'div[contenteditable="true"]'
 
-# JS: возвращает <img> сгенерированной картинки, src которой ОТСУТСТВУЕТ в
-# baselineList (картинки, которые были на странице ДО нашего submit).
-# Это защищает от того, что ChatGPT-проект переоткрывает старый чат с уже
-# готовой картинкой — мы её не пропускаем как "свежую".
+# JS: возвращает <img> СГЕНЕРИРОВАННОЙ картинки.
 #
-# Три стратегии поиска (защита от смены DOM):
-#   1) <img> внутри последнего [data-message-author-role="assistant"] (или
-#      data-author-role) с naturalWidth > 600 и complete=true
-#   2) <img> чей src содержит признак сгенерированной картинки OpenAI
-#      (oaiusercontent / dalle / sediment)
-#   3) Самая большая картинка на странице (только если их ≥ 4 = эталоны+input+gen)
+# Жёсткое условие: картинка ДОЛЖНА быть внутри сообщения с ролью assistant.
+# Никакие альтернативные стратегии (по src-паттерну, "самая большая на странице")
+# не используются — они ловят пользовательский input (загруженные ChatGPT'ом
+# фото лежат в src oaiusercontent.com и проходили regex-стратегию).
+#
+# baselineList — src которые БЫЛИ на странице до submit (включая старые
+# assistant-картинки из переоткрытого чата проекта). Их игнорируем.
 FIND_GENERATED_IMG_JS = """
     (baselineList) => {
         const baseline = new Set(baselineList || []);
-        const isFresh = im => im.src && !baseline.has(im.src);
-
-        const all = [...document.querySelectorAll('img')]
-            .filter(im => im.complete && im.naturalWidth > 600 && isFresh(im));
-
         const msgs = [...document.querySelectorAll(
             '[data-message-author-role=\\"assistant\\"], [data-author-role=\\"assistant\\"]'
         )];
-        if (msgs.length) {
-            const inLast = [...msgs[msgs.length - 1].querySelectorAll('img')]
-                .filter(im => im.complete && im.naturalWidth > 600 && isFresh(im));
-            if (inLast.length) return inLast[inLast.length - 1];
-        }
-        const gen = all.filter(im => /oaiusercontent|\\/dalle\\/|sediment/.test(im.src || ''));
-        if (gen.length) return gen[gen.length - 1];
-        if (all.length >= 1) {
-            return all.slice().sort((a, b) => b.naturalWidth - a.naturalWidth)[0];
-        }
-        return null;
+        if (!msgs.length) return null;
+        const last = msgs[msgs.length - 1];
+        const cand = [...last.querySelectorAll('img')].filter(
+            im => im.complete && im.naturalWidth > 600
+                  && im.src && !baseline.has(im.src)
+        );
+        return cand.length ? cand[cand.length - 1] : null;
     }
 """
 
@@ -301,14 +290,16 @@ async def process_one_file(file_path: Path) -> Path:
             await paste_image(page, file_path, settle_seconds=5.0)
             await paste_text(page, PROMPT_TEMPLATE)
 
-            # Снимаем baseline ВСЕХ src картинок ДО submit — потом считаем
-            # готовой только ту картинку, которой не было в baseline.
-            # Это защищает от ситуации когда ChatGPT-проект переоткрывает
-            # старый чат с уже готовой картинкой с прошлой задачи.
-            baseline_srcs = await snapshot_image_srcs(page)
-            log.info("Baseline картинок до submit: %d", len(baseline_srcs))
-
             await submit(page)
+
+            # Снимаем baseline ПОСЛЕ submit и settle-паузы. После submit ChatGPT
+            # перерисовывает загруженные пользователем картинки с новым src
+            # (preview-blob → oaiusercontent.com) — если снять baseline ДО, эти
+            # новые URLs пройдут как "свежие" и селектор скачает input-фото.
+            # 5 сек хватает чтобы все user-картинки получили финальный URL.
+            await asyncio.sleep(5)
+            baseline_srcs = await snapshot_image_srcs(page)
+            log.info("Baseline картинок после submit: %d", len(baseline_srcs))
 
             await wait_for_generation(page, GENERATION_TIMEOUT_SEC * 1000, baseline_srcs)
             await download_via_anchor(page, output_path, baseline_srcs)
