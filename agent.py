@@ -16,14 +16,13 @@ from playwright.async_api import Browser, Page, async_playwright
 
 from clipboard_utils import copy_image_to_clipboard, copy_text_to_clipboard
 from config import (
-    CHATGPT_PROJECT_URL,
     CHROME_CDP_URL,
+    DEFAULT_MODE,
     GENERATION_TIMEOUT_SEC,
     LOGS_DIR,
     OUTPUT_DIR,
     PROCESSED_DIR,
-    PROMPT_TEMPLATE,
-    REFERENCE_FILES,
+    get_mode,
 )
 
 logging.basicConfig(
@@ -292,11 +291,21 @@ def archive_input(file_path: Path) -> Path:
     return target
 
 
-async def process_one_file(file_path: Path) -> Path:
+async def process_one_file(file_path: Path, mode: str = DEFAULT_MODE) -> Path:
+    cfg = get_mode(mode)
+    if not cfg.is_configured:
+        raise RuntimeError(
+            f"Режим '{cfg.key}' ({cfg.label}) не настроен: "
+            f"project_url={'есть' if cfg.project_url else 'НЕТ'}, "
+            f"эталоны={'все на месте' if all(f.exists() for f in cfg.reference_files) else 'НЕ найдены'}"
+        )
+
     output_path = make_output_path()
-    # Открываем чат в проекте если задан URL, иначе обычный chatgpt.com
-    chat_url = CHATGPT_PROJECT_URL or "https://chatgpt.com/"
-    log.info("=== Обработка: %s → %s (url: %s) ===", file_path.name, output_path.name, chat_url)
+    chat_url = cfg.project_url or "https://chatgpt.com/"
+    log.info(
+        "=== Обработка: %s → %s (mode: %s, url: %s) ===",
+        file_path.name, output_path.name, cfg.key, chat_url,
+    )
 
     async with async_playwright() as p:
         browser = await p.chromium.connect_over_cdp(CHROME_CDP_URL)
@@ -304,13 +313,13 @@ async def process_one_file(file_path: Path) -> Path:
             page = await find_or_open_chatgpt(browser)
             await open_new_chat(page, url=chat_url)
 
-            for ref in REFERENCE_FILES:
+            for ref in cfg.reference_files:
                 if not ref.exists():
                     raise FileNotFoundError(f"Эталон не найден: {ref}")
                 await paste_image(page, ref)
 
             await paste_image(page, file_path, settle_seconds=5.0)
-            await paste_text(page, PROMPT_TEMPLATE)
+            await paste_text(page, cfg.prompt)
 
             await submit(page)
 

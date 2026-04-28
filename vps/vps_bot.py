@@ -57,6 +57,23 @@ log = logging.getLogger("vps_bot")
 
 
 # ---------------------------------------------------------------------------
+# Режимы (типы товаров)
+# ---------------------------------------------------------------------------
+# Боту достаточно знать только key → label. Полная конфигурация (project_url,
+# эталоны, промпт) живёт на стороне агента в config.py — бот про неё ничего
+# не знает. Чтобы добавить новый режим: дописать строку сюда + Mode(...) в
+# локальный config.py агента.
+
+MODES_LABELS: dict[str, str] = {
+    "ritual":      "🕯 Ритуал",
+    "wreath":      "⚜️ Венки",
+    "conditioner": "❄️ Кондиционеры",
+}
+DEFAULT_MODE = "ritual"
+MODE_BY_LABEL = {v: k for k, v in MODES_LABELS.items()}
+
+
+# ---------------------------------------------------------------------------
 # DB helpers
 # ---------------------------------------------------------------------------
 
@@ -74,6 +91,7 @@ def init_db() -> None:
                 chat_id         INTEGER NOT NULL,
                 input_filename  TEXT    NOT NULL,
                 status          TEXT    NOT NULL DEFAULT 'pending',
+                mode            TEXT    NOT NULL DEFAULT 'ritual',
                 created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 output_filename   TEXT,
@@ -83,11 +101,46 @@ def init_db() -> None:
                 result_sent     INTEGER DEFAULT 0
             )
         """)
-        # Миграция: добавляем failed_filename если его нет (для существующих БД)
-        try:
-            conn.execute("ALTER TABLE jobs ADD COLUMN failed_filename TEXT")
-        except Exception:
-            pass
+        # Миграции для существующих БД (ALTER TABLE кидает если колонка уже есть)
+        for ddl in (
+            "ALTER TABLE jobs ADD COLUMN failed_filename TEXT",
+            "ALTER TABLE jobs ADD COLUMN mode TEXT NOT NULL DEFAULT 'ritual'",
+        ):
+            try:
+                conn.execute(ddl)
+            except Exception:
+                pass
+        # Per-user текущий режим — что бот будет ставить в job при следующем фото
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_state (
+                chat_id    INTEGER PRIMARY KEY,
+                mode       TEXT    NOT NULL DEFAULT 'ritual',
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.commit()
+
+
+def get_user_mode(chat_id: int) -> str:
+    """Текущий режим пользователя (default = ritual)."""
+    with db_conn() as conn:
+        row = conn.execute(
+            "SELECT mode FROM user_state WHERE chat_id=?", (chat_id,)
+        ).fetchone()
+    if row and row["mode"] in MODES_LABELS:
+        return row["mode"]
+    return DEFAULT_MODE
+
+
+def set_user_mode(chat_id: int, mode: str) -> None:
+    if mode not in MODES_LABELS:
+        return
+    with db_conn() as conn:
+        conn.execute(
+            "INSERT INTO user_state (chat_id, mode, updated_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(chat_id) DO UPDATE SET mode=excluded.mode, updated_at=excluded.updated_at",
+            (chat_id, mode, datetime.now().isoformat()),
+        )
         conn.commit()
 
 
@@ -109,8 +162,12 @@ BTN_STATUS  = "📊 Статус"
 BTN_CLEAR   = "❌ Очистить очередь"
 BTN_RESTART = "♻️ Рестарт зависших"
 
+# Reply-клавиатура: первый ряд — режимы, второй — Статус, третий — действия.
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
+        [KeyboardButton(MODES_LABELS["ritual"]),
+         KeyboardButton(MODES_LABELS["wreath"]),
+         KeyboardButton(MODES_LABELS["conditioner"])],
         [KeyboardButton(BTN_STATUS)],
         [KeyboardButton(BTN_CLEAR), KeyboardButton(BTN_RESTART)],
     ],
@@ -124,6 +181,13 @@ def _pending_count() -> int:
         return conn.execute("SELECT COUNT(*) FROM jobs WHERE status='pending'").fetchone()[0]
 
 
+def _pending_count_by_mode(mode: str) -> int:
+    with db_conn() as conn:
+        return conn.execute(
+            "SELECT COUNT(*) FROM jobs WHERE status='pending' AND mode=?", (mode,)
+        ).fetchone()[0]
+
+
 # ---------------------------------------------------------------------------
 # Handlers
 # ---------------------------------------------------------------------------
@@ -132,12 +196,17 @@ async def cmd_start(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_user or not _allowed(update.effective_user.id):
         await update.message.reply_text("Доступ запрещён.")
         return
+    chat_id = update.effective_chat.id
+    current_mode = get_user_mode(chat_id)
+    modes_list = "\n".join(f"  {label}" for label in MODES_LABELS.values())
     await update.message.reply_text(
-        "Привет! Пришли мне фото товара (как фото или документ) — обработаю в карточку.\n\n"
-        "Кнопки внизу экрана:\n"
+        f"Привет! Текущий режим: {MODES_LABELS[current_mode]}\n"
+        "Пришли фото — обработаю как карточку для этого режима.\n\n"
+        f"Переключение режима — кнопкой:\n{modes_list}\n\n"
+        "Действия:\n"
         f"  {BTN_STATUS} — счётчик очереди\n"
-        f"  {BTN_CLEAR} — снять все ожидающие задачи\n"
-        f"  {BTN_RESTART} — пере-запустить зависшие (processing >5 мин)",
+        f"  {BTN_CLEAR} — снять все ожидающие\n"
+        f"  {BTN_RESTART} — пере-запустить зависшие (>5 мин)",
         reply_markup=MAIN_KEYBOARD,
     )
 
@@ -149,13 +218,24 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_status(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_user or not _allowed(update.effective_user.id):
         return
+    chat_id = update.effective_chat.id
+    current_mode = get_user_mode(chat_id)
     with db_conn() as conn:
         pending    = conn.execute("SELECT COUNT(*) FROM jobs WHERE status='pending'").fetchone()[0]
         processing = conn.execute("SELECT COUNT(*) FROM jobs WHERE status='processing'").fetchone()[0]
         done       = conn.execute("SELECT COUNT(*) FROM jobs WHERE status='done'").fetchone()[0]
         cancelled  = conn.execute("SELECT COUNT(*) FROM jobs WHERE status='cancelled'").fetchone()[0]
+        # Разбивка очереди по режимам
+        by_mode_rows = conn.execute(
+            "SELECT mode, COUNT(*) FROM jobs WHERE status='pending' GROUP BY mode"
+        ).fetchall()
+    by_mode = "\n".join(
+        f"  {MODES_LABELS.get(r[0], r[0])}: {r[1]}" for r in by_mode_rows
+    ) or "  (пусто)"
     await update.message.reply_text(
+        f"Ваш режим: {MODES_LABELS[current_mode]}\n\n"
         f"В очереди:       {pending}\n"
+        f"  по режимам:\n{by_mode}\n"
         f"Обрабатывается:  {processing}\n"
         f"Готово всего:    {done}\n"
         f"Отменено:        {cancelled}",
@@ -209,7 +289,23 @@ async def on_keyboard_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
     """Обработчик нажатий reply-клавиатуры (приходят как обычные текстовые сообщения)."""
     if not update.message or not update.message.text:
         return
+    if not update.effective_user or not _allowed(update.effective_user.id):
+        return
     text = update.message.text.strip()
+    chat_id = update.effective_chat.id
+
+    # Переключение режима
+    if text in MODE_BY_LABEL:
+        new_mode = MODE_BY_LABEL[text]
+        set_user_mode(chat_id, new_mode)
+        await update.message.reply_text(
+            f"✅ Режим переключён: {MODES_LABELS[new_mode]}\n"
+            "Все следующие фото будут обрабатываться в этом режиме.",
+            reply_markup=MAIN_KEYBOARD,
+        )
+        return
+
+    # Действия
     if text == BTN_STATUS:
         await cmd_status(update, ctx)
     elif text == BTN_CLEAR:
@@ -241,20 +337,24 @@ async def handle_photo(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     await tg_file.download_to_drive(str(target))
     log.info("Сохранил: %s (%d байт)", filename, target.stat().st_size)
 
+    mode = get_user_mode(msg.chat_id)
     with db_conn() as conn:
         conn.execute(
-            "INSERT INTO jobs (chat_id, input_filename) VALUES (?, ?)",
-            (msg.chat_id, filename),
+            "INSERT INTO jobs (chat_id, input_filename, mode) VALUES (?, ?, ?)",
+            (msg.chat_id, filename, mode),
         )
         conn.commit()
 
-    with db_conn() as conn:
-        pending = conn.execute("SELECT COUNT(*) FROM jobs WHERE status='pending'").fetchone()[0]
-
+    pending = _pending_count()
+    mode_label = MODES_LABELS[mode]
     if pending == 1:
-        await msg.reply_text("✅ Принял. Обрабатываю прямо сейчас (~1–2 мин).")
+        await msg.reply_text(
+            f"✅ Принял ({mode_label}). Обрабатываю прямо сейчас (~1–2 мин)."
+        )
     else:
-        await msg.reply_text(f"✅ Принял. В очереди: {pending}.")
+        await msg.reply_text(
+            f"✅ Принял ({mode_label}). В очереди: {pending}."
+        )
 
 
 async def on_callback(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
@@ -388,8 +488,10 @@ async def result_sender(app: Application) -> None:
                         )],
                     ])
                     pending_now = _pending_count()
+                    job_mode = row["mode"] if "mode" in row.keys() else DEFAULT_MODE
+                    mode_label = MODES_LABELS.get(job_mode, job_mode)
                     caption = (
-                        f"✅ Готово: {row['output_filename']}\n"
+                        f"✅ Готово ({mode_label}): {row['output_filename']}\n"
                         f"В очереди: {pending_now}"
                     )
                     with open(out_path, "rb") as f:
@@ -466,8 +568,11 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.Document.IMAGE, handle_photo))
     # Reply-клавиатура шлёт обычный текст — ловим точные совпадения с подписями кнопок
+    import re
+    button_labels = list(MODES_LABELS.values()) + [BTN_STATUS, BTN_CLEAR, BTN_RESTART]
+    pattern = "^(" + "|".join(re.escape(b) for b in button_labels) + ")$"
     app.add_handler(MessageHandler(
-        filters.TEXT & filters.Regex(f"^({BTN_STATUS}|{BTN_CLEAR}|{BTN_RESTART})$"),
+        filters.TEXT & filters.Regex(pattern),
         on_keyboard_text,
     ))
     app.add_handler(CallbackQueryHandler(on_callback))

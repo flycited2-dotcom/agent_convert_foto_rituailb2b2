@@ -57,7 +57,9 @@ def next_job(x_agent_token: str = Header(...)):
             (datetime.now().isoformat(), row["id"]),
         )
         conn.commit()
-    return {"id": row["id"], "input_filename": row["input_filename"]}
+    # mode может отсутствовать в очень старых строках — отдаём 'ritual' для совместимости
+    mode = (row["mode"] if "mode" in row.keys() else None) or "ritual"
+    return {"id": row["id"], "input_filename": row["input_filename"], "mode": mode}
 
 
 @app.get("/api/input/{job_id}")
