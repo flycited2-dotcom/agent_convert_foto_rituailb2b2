@@ -65,7 +65,7 @@ log = logging.getLogger("vps_bot")
 # локальный config.py агента.
 
 MODES_LABELS: dict[str, str] = {
-    "ritual":      "🕯 Ритуал",
+    "ritual":      "🧺 Корзинки",
     "wreath":      "⚜️ Венки",
     "conditioner": "❄️ Кондиционеры",
 }

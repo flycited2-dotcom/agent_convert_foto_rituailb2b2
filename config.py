@@ -111,7 +111,7 @@ _CONDITIONER_PROMPT = os.getenv(
 MODES: dict[str, Mode] = {
     "ritual": Mode(
         key="ritual",
-        label="🕯 Ритуал",
+        label="🧺 Корзинки",
         project_url=os.getenv(
             "RITUAL_PROJECT_URL",
             # совместимость со старой переменной CHATGPT_PROJECT_URL
