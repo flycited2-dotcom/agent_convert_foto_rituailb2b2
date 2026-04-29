@@ -18,11 +18,13 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from telegram import (
+    BotCommand,
     ForceReply,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InputFile,
     KeyboardButton,
+    MenuButtonCommands,
     ReplyKeyboardMarkup,
     Update,
 )
@@ -446,7 +448,10 @@ async def handle_photo(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         tg_file = await msg.document.get_file()
         ext = Path(msg.document.file_name or "input.jpg").suffix or ".jpg"
     else:
-        await msg.reply_text("Пришли мне ФОТО (как картинку или как файл-изображение).")
+        await msg.reply_text(
+            "Пришли мне ФОТО (как картинку или как файл-изображение).",
+            reply_markup=MAIN_KEYBOARD,
+        )
         return
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
@@ -479,11 +484,13 @@ async def handle_photo(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
 
     if pending == 1:
         await msg.reply_text(
-            f"✅ Принял ({mode_label}). Обрабатываю прямо сейчас (~1–2 мин).{specs_hint}"
+            f"✅ Принял ({mode_label}). Обрабатываю прямо сейчас (~1–2 мин).{specs_hint}",
+            reply_markup=MAIN_KEYBOARD,
         )
     else:
         await msg.reply_text(
-            f"✅ Принял ({mode_label}). В очереди: {pending}.{specs_hint}"
+            f"✅ Принял ({mode_label}). В очереди: {pending}.{specs_hint}",
+            reply_markup=MAIN_KEYBOARD,
         )
 
 
@@ -503,25 +510,25 @@ async def on_callback(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         action, _, job_id_str = data.partition(":")
         job_id = int(job_id_str)
     except ValueError:
-        await q.message.reply_text(f"Неизвестный callback: {data}")
+        await q.message.reply_text(f"Неизвестный callback: {data}", reply_markup=MAIN_KEYBOARD)
         return
 
     with db_conn() as conn:
         row = conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
     if not row:
-        await q.message.reply_text(f"Задача #{job_id} не найдена в БД.")
+        await q.message.reply_text(f"Задача #{job_id} не найдена в БД.", reply_markup=MAIN_KEYBOARD)
         return
 
     if action == "redo":
         archived_name = row["archived_filename"]
         if not archived_name:
-            await q.message.reply_text("⚠️ У этой задачи нет исходника в processed/.")
+            await q.message.reply_text("⚠️ У этой задачи нет исходника в processed/.", reply_markup=MAIN_KEYBOARD)
             return
         src = PROCESSED_DIR / archived_name
         if not src.exists():
             await q.message.reply_text(
                 f"⚠️ Исходник «{archived_name}» не найден в processed/. Пришли фото заново."
-            )
+            , reply_markup=MAIN_KEYBOARD)
             return
         ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
         new_filename = f"redo_{ts}_{archived_name}"
@@ -533,20 +540,21 @@ async def on_callback(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
             )
             conn.commit()
         await q.message.reply_text(
-            f"♻️ Поставил на повторную генерацию. В очереди: {_pending_count()}."
+            f"♻️ Поставил на повторную генерацию. В очереди: {_pending_count()}.",
+            reply_markup=MAIN_KEYBOARD,
         )
         return
 
     if action == "retry":
         failed_name = row["failed_filename"]
         if not failed_name:
-            await q.message.reply_text("⚠️ У этой задачи нет исходника в failed/.")
+            await q.message.reply_text("⚠️ У этой задачи нет исходника в failed/.", reply_markup=MAIN_KEYBOARD)
             return
         src = FAILED_DIR / failed_name
         if not src.exists():
             await q.message.reply_text(
                 f"⚠️ Файл «{failed_name}» не найден в failed/. Пришли фото заново."
-            )
+            , reply_markup=MAIN_KEYBOARD)
             return
         ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
         new_filename = f"retry_{ts}_{failed_name}"
@@ -558,26 +566,27 @@ async def on_callback(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
             )
             conn.commit()
         await q.message.reply_text(
-            f"🔄 Поставил на повтор. В очереди: {_pending_count()}."
+            f"🔄 Поставил на повтор. В очереди: {_pending_count()}.",
+            reply_markup=MAIN_KEYBOARD,
         )
         return
 
     if action == "bad":
         bad_name = row["output_filename"]
         if not bad_name:
-            await q.message.reply_text("⚠️ У этой задачи нет output_filename.")
+            await q.message.reply_text("⚠️ У этой задачи нет output_filename.", reply_markup=MAIN_KEYBOARD)
             return
         src = OUTPUT_DIR / bad_name
         if not src.exists():
-            await q.message.reply_text(f"Файл «{bad_name}» уже не в output/.")
+            await q.message.reply_text(f"Файл «{bad_name}» уже не в output/.", reply_markup=MAIN_KEYBOARD)
             return
         bad_dir = OUTPUT_DIR.parent / "bad_results"
         bad_dir.mkdir(exist_ok=True)
         try:
             src.rename(bad_dir / bad_name)
-            await q.message.reply_text(f"🗑 Перенёс в bad_results/: {bad_name}")
+            await q.message.reply_text(f"🗑 Перенёс в bad_results/: {bad_name}", reply_markup=MAIN_KEYBOARD)
         except Exception as e:
-            await q.message.reply_text(f"Не получилось перенести: {e}")
+            await q.message.reply_text(f"Не получилось перенести: {e}", reply_markup=MAIN_KEYBOARD)
 
 
 # ---------------------------------------------------------------------------
@@ -670,6 +679,22 @@ async def result_sender(app: Application) -> None:
 
 async def post_init(app: Application) -> None:
     init_db()
+
+    # Slash-меню (синяя кнопка слева от поля ввода) — список доступных команд.
+    # Telegram-клиент будет показывать это меню всегда, пока бот не сменит.
+    await app.bot.set_my_commands([
+        BotCommand("start",         "Главное меню и режимы"),
+        BotCommand("status",        "Очередь, режим, характеристики"),
+        BotCommand("specs",         "Ввести характеристики (для кондиционеров)"),
+        BotCommand("clear",         "Снять все ожидающие задачи"),
+        BotCommand("restart_stuck", "Пере-запустить зависшие (>5 мин)"),
+        BotCommand("help",          "Справка"),
+    ])
+    # Кнопка «Menu» (рядом с полем ввода) — открывает список команд выше.
+    # Без этого вызова Telegram показывает дефолтную кнопку «/», которая для
+    # некоторых клиентов выглядит менее заметно.
+    await app.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+
     # asyncio.create_task работает корректно, т.к. post_init вызывается внутри event loop
     import asyncio as _asyncio
     _asyncio.get_event_loop().create_task(result_sender(app))
