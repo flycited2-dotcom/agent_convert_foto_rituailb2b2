@@ -18,6 +18,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from telegram import (
+    ForceReply,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InputFile,
@@ -72,6 +73,16 @@ MODES_LABELS: dict[str, str] = {
 DEFAULT_MODE = "ritual"
 MODE_BY_LABEL = {v: k for k, v in MODES_LABELS.items()}
 
+# Какие режимы требуют ввод характеристик пользователем перед генерацией.
+# Должен совпадать с requires_specs в локальном config.py агента.
+MODES_WITH_SPECS = {"conditioner"}
+
+# Маркер сообщения-приглашения ввести характеристики. Telegram не отдаёт
+# нам напрямую "это reply на ForceReply", но мы можем узнать ответ по
+# message.reply_to_message.text — сравнивая с этим уникальным заголовком.
+SPECS_PROMPT_HEADER = "📝 Характеристики кондиционера"
+BTN_SPECS = "📝 Характеристики"
+
 
 # ---------------------------------------------------------------------------
 # DB helpers
@@ -105,19 +116,25 @@ def init_db() -> None:
         for ddl in (
             "ALTER TABLE jobs ADD COLUMN failed_filename TEXT",
             "ALTER TABLE jobs ADD COLUMN mode TEXT NOT NULL DEFAULT 'ritual'",
+            "ALTER TABLE jobs ADD COLUMN specs TEXT",
         ):
             try:
                 conn.execute(ddl)
             except Exception:
                 pass
-        # Per-user текущий режим — что бот будет ставить в job при следующем фото
+        # Per-user текущий режим + черновик характеристик для следующего фото
         conn.execute("""
             CREATE TABLE IF NOT EXISTS user_state (
-                chat_id    INTEGER PRIMARY KEY,
-                mode       TEXT    NOT NULL DEFAULT 'ritual',
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                chat_id        INTEGER PRIMARY KEY,
+                mode           TEXT NOT NULL DEFAULT 'ritual',
+                pending_specs  TEXT,
+                updated_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        try:
+            conn.execute("ALTER TABLE user_state ADD COLUMN pending_specs TEXT")
+        except Exception:
+            pass
         conn.commit()
 
 
@@ -144,6 +161,27 @@ def set_user_mode(chat_id: int, mode: str) -> None:
         conn.commit()
 
 
+def get_user_specs(chat_id: int) -> str | None:
+    """Текущий черновик характеристик пользователя (используется для следующего фото)."""
+    with db_conn() as conn:
+        row = conn.execute(
+            "SELECT pending_specs FROM user_state WHERE chat_id=?", (chat_id,)
+        ).fetchone()
+    return (row["pending_specs"] if row and row["pending_specs"] else None)
+
+
+def set_user_specs(chat_id: int, specs: str | None) -> None:
+    with db_conn() as conn:
+        conn.execute(
+            "INSERT INTO user_state (chat_id, mode, pending_specs, updated_at) "
+            "VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(chat_id) DO UPDATE SET "
+            "pending_specs=excluded.pending_specs, updated_at=excluded.updated_at",
+            (chat_id, DEFAULT_MODE, specs, datetime.now().isoformat()),
+        )
+        conn.commit()
+
+
 # ---------------------------------------------------------------------------
 # Auth
 # ---------------------------------------------------------------------------
@@ -162,13 +200,13 @@ BTN_STATUS  = "📊 Статус"
 BTN_CLEAR   = "❌ Очистить очередь"
 BTN_RESTART = "♻️ Рестарт зависших"
 
-# Reply-клавиатура: первый ряд — режимы, второй — Статус, третий — действия.
+# Reply-клавиатура: режимы / характеристики+статус / действия.
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
         [KeyboardButton(MODES_LABELS["ritual"]),
          KeyboardButton(MODES_LABELS["wreath"]),
          KeyboardButton(MODES_LABELS["conditioner"])],
-        [KeyboardButton(BTN_STATUS)],
+        [KeyboardButton(BTN_SPECS), KeyboardButton(BTN_STATUS)],
         [KeyboardButton(BTN_CLEAR), KeyboardButton(BTN_RESTART)],
     ],
     resize_keyboard=True,
@@ -220,6 +258,7 @@ async def cmd_status(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         return
     chat_id = update.effective_chat.id
     current_mode = get_user_mode(chat_id)
+    current_specs = get_user_specs(chat_id)
     with db_conn() as conn:
         pending    = conn.execute("SELECT COUNT(*) FROM jobs WHERE status='pending'").fetchone()[0]
         processing = conn.execute("SELECT COUNT(*) FROM jobs WHERE status='processing'").fetchone()[0]
@@ -232,8 +271,18 @@ async def cmd_status(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     by_mode = "\n".join(
         f"  {MODES_LABELS.get(r[0], r[0])}: {r[1]}" for r in by_mode_rows
     ) or "  (пусто)"
+
+    specs_block = ""
+    if current_mode in MODES_WITH_SPECS:
+        if current_specs:
+            preview = current_specs if len(current_specs) <= 200 else current_specs[:200] + "…"
+            specs_block = f"\nХарактеристики ({len(current_specs)} симв.):\n{preview}\n"
+        else:
+            specs_block = "\nХарактеристики не заданы (будет дефолт из промпта)\n"
+
     await update.message.reply_text(
-        f"Ваш режим: {MODES_LABELS[current_mode]}\n\n"
+        f"Ваш режим: {MODES_LABELS[current_mode]}"
+        f"{specs_block}\n"
         f"В очереди:       {pending}\n"
         f"  по режимам:\n{by_mode}\n"
         f"Обрабатывается:  {processing}\n"
@@ -285,6 +334,73 @@ async def cmd_restart_stuck(update: Update, _: ContextTypes.DEFAULT_TYPE) -> Non
     )
 
 
+async def cmd_request_specs(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    """Пользователь нажал «📝 Характеристики» — просим ответить на это сообщение
+    списком характеристик. Связь устанавливается через ForceReply: ответ Telegram
+    автоматически прикрепит к нему reply_to_message, по тексту которого мы
+    распознаем «это специи»."""
+    if not update.effective_user or not _allowed(update.effective_user.id):
+        return
+    current = get_user_specs(update.effective_chat.id)
+    current_block = (
+        f"\n\nСейчас сохранено:\n{current}" if current else
+        "\n\n(Пока не задано — будет использован дефолтный список.)"
+    )
+    await update.message.reply_text(
+        f"{SPECS_PROMPT_HEADER}\n\n"
+        "Ответьте на это сообщение списком характеристик — каждая на отдельной строке. "
+        "Они подставятся в промпт при следующей генерации в режиме «❄️ Кондиционеры»."
+        f"{current_block}\n\n"
+        "Пример:\n"
+        "Инверторный компрессор\n"
+        "Класс энергоэффективности A++\n"
+        "Уровень шума 22 дБ\n"
+        "Площадь до 25 м²",
+        reply_markup=ForceReply(selective=True, input_field_placeholder="Список характеристик…"),
+    )
+
+
+async def on_specs_reply(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    """Reply на сообщение-приглашение — сохраняем введённые характеристики."""
+    msg = update.message
+    if not msg or not msg.text:
+        return
+    if not update.effective_user or not _allowed(update.effective_user.id):
+        return
+    text = msg.text.strip()
+    if not text:
+        return
+
+    # Команда сброса
+    if text.lower() in ("сброс", "reset", "очистить", "clear"):
+        set_user_specs(update.effective_chat.id, None)
+        await msg.reply_text(
+            "🗑 Характеристики сброшены. Будет использован дефолтный список из промпта.",
+            reply_markup=MAIN_KEYBOARD,
+        )
+        return
+
+    set_user_specs(update.effective_chat.id, text)
+    await msg.reply_text(
+        f"✅ Характеристики сохранены ({len(text)} симв.).\n"
+        "При следующем фото в режиме «❄️ Кондиционеры» они будут подставлены в промпт.\n\n"
+        "Чтобы изменить — снова нажмите «📝 Характеристики».\n"
+        "Чтобы сбросить — ответьте на любое сообщение бота словом «сброс».",
+        reply_markup=MAIN_KEYBOARD,
+    )
+
+
+async def _route_reply(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Текст-reply на сообщение бота: если это reply на специальный заголовок —
+    роутим на on_specs_reply, иначе игнорим (обычный reply пользователя)."""
+    msg = update.message
+    if not msg or not msg.reply_to_message:
+        return
+    parent_text = msg.reply_to_message.text or ""
+    if parent_text.startswith(SPECS_PROMPT_HEADER) or "Характеристики сохранены" in parent_text:
+        await on_specs_reply(update, ctx)
+
+
 async def on_keyboard_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Обработчик нажатий reply-клавиатуры (приходят как обычные текстовые сообщения)."""
     if not update.message or not update.message.text:
@@ -312,6 +428,8 @@ async def on_keyboard_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
         await cmd_clear_queue(update, ctx)
     elif text == BTN_RESTART:
         await cmd_restart_stuck(update, ctx)
+    elif text == BTN_SPECS:
+        await cmd_request_specs(update, ctx)
 
 
 async def handle_photo(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
@@ -338,22 +456,34 @@ async def handle_photo(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     log.info("Сохранил: %s (%d байт)", filename, target.stat().st_size)
 
     mode = get_user_mode(msg.chat_id)
+    specs = get_user_specs(msg.chat_id) if mode in MODES_WITH_SPECS else None
     with db_conn() as conn:
         conn.execute(
-            "INSERT INTO jobs (chat_id, input_filename, mode) VALUES (?, ?, ?)",
-            (msg.chat_id, filename, mode),
+            "INSERT INTO jobs (chat_id, input_filename, mode, specs) VALUES (?, ?, ?, ?)",
+            (msg.chat_id, filename, mode, specs),
         )
         conn.commit()
 
     pending = _pending_count()
     mode_label = MODES_LABELS[mode]
+
+    # Подсказка если режиму нужны специи, а пользователь их не задал
+    specs_hint = ""
+    if mode in MODES_WITH_SPECS and not specs:
+        specs_hint = (
+            "\n⚠️ Характеристики не заданы — будет использован дефолтный список. "
+            "Чтобы задать свои — нажмите «📝 Характеристики»."
+        )
+    elif specs:
+        specs_hint = f"\n📝 С характеристиками ({len(specs)} симв.)"
+
     if pending == 1:
         await msg.reply_text(
-            f"✅ Принял ({mode_label}). Обрабатываю прямо сейчас (~1–2 мин)."
+            f"✅ Принял ({mode_label}). Обрабатываю прямо сейчас (~1–2 мин).{specs_hint}"
         )
     else:
         await msg.reply_text(
-            f"✅ Принял ({mode_label}). В очереди: {pending}."
+            f"✅ Принял ({mode_label}). В очереди: {pending}.{specs_hint}"
         )
 
 
@@ -565,11 +695,20 @@ def main() -> None:
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("clear", cmd_clear_queue))
     app.add_handler(CommandHandler("restart_stuck", cmd_restart_stuck))
+    app.add_handler(CommandHandler("specs", cmd_request_specs))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.Document.IMAGE, handle_photo))
+
+    # Ответ на ForceReply-приглашение «📝 Характеристики кондиционера…».
+    # Должен идти РАНЬШЕ чем on_keyboard_text — иначе текст попадёт в общий хендлер.
+    app.add_handler(MessageHandler(
+        filters.TEXT & filters.REPLY,
+        _route_reply,
+    ))
+
     # Reply-клавиатура шлёт обычный текст — ловим точные совпадения с подписями кнопок
     import re
-    button_labels = list(MODES_LABELS.values()) + [BTN_STATUS, BTN_CLEAR, BTN_RESTART]
+    button_labels = list(MODES_LABELS.values()) + [BTN_SPECS, BTN_STATUS, BTN_CLEAR, BTN_RESTART]
     pattern = "^(" + "|".join(re.escape(b) for b in button_labels) + ")$"
     app.add_handler(MessageHandler(
         filters.TEXT & filters.Regex(pattern),

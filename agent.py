@@ -291,7 +291,11 @@ def archive_input(file_path: Path) -> Path:
     return target
 
 
-async def process_one_file(file_path: Path, mode: str = DEFAULT_MODE) -> Path:
+async def process_one_file(
+    file_path: Path,
+    mode: str = DEFAULT_MODE,
+    specs: str | None = None,
+) -> Path:
     cfg = get_mode(mode)
     if not cfg.is_configured:
         raise RuntimeError(
@@ -300,11 +304,13 @@ async def process_one_file(file_path: Path, mode: str = DEFAULT_MODE) -> Path:
             f"эталоны={'все на месте' if all(f.exists() for f in cfg.reference_files) else 'НЕ найдены'}"
         )
 
+    rendered_prompt = cfg.render_prompt(specs)
     output_path = make_output_path()
     chat_url = cfg.project_url or "https://chatgpt.com/"
     log.info(
-        "=== Обработка: %s → %s (mode: %s, url: %s) ===",
-        file_path.name, output_path.name, cfg.key, chat_url,
+        "=== Обработка: %s → %s (mode: %s, specs: %d симв., url: %s) ===",
+        file_path.name, output_path.name, cfg.key,
+        len(specs or ""), chat_url,
     )
 
     async with async_playwright() as p:
@@ -319,7 +325,7 @@ async def process_one_file(file_path: Path, mode: str = DEFAULT_MODE) -> Path:
                 await paste_image(page, ref)
 
             await paste_image(page, file_path, settle_seconds=5.0)
-            await paste_text(page, cfg.prompt)
+            await paste_text(page, rendered_prompt)
 
             await submit(page)
 

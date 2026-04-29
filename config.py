@@ -46,66 +46,61 @@ for d in (INPUT_DIR, OUTPUT_DIR, PROCESSED_DIR, FAILED_DIR, REFERENCE_DIR, LOGS_
 # Эталоны лежат в reference/<key>/ — etalon_1.png, etalon_2.png (можно больше).
 # project_url — URL проекта в ChatGPT (берётся из .env).
 
+PROMPTS_DIR = ROOT / "prompts"
+
+
 @dataclass
 class Mode:
     key: str
     label: str               # подпись на кнопке Telegram
     project_url: str         # ChatGPT project URL ("" если не настроен)
     reference_files: list[Path]
-    prompt: str
+    prompt: str              # может содержать плейсхолдер {{SPECS}}
     enabled: bool = True
+    # Если True — пользователь должен ввести характеристики перед генерацией.
+    # Промпт ОБЯЗАН содержать {{SPECS}}, иначе ввод бессмыслен.
+    requires_specs: bool = False
+    # Дефолтные характеристики, если пользователь не ввёл свои (fallback).
+    default_specs: str = ""
 
     @property
     def is_configured(self) -> bool:
-        """Готов ли режим к работе: есть URL и все эталоны существуют."""
+        """Готов ли режим к работе: есть URL, есть промпт, есть хотя бы 1 эталон."""
         if not self.enabled:
             return False
         if not self.project_url:
             return False
-        return all(f.exists() for f in self.reference_files)
+        if not self.prompt or not self.prompt.strip():
+            return False
+        return any(f.exists() for f in self.reference_files) and bool(self.reference_files)
+
+    def render_prompt(self, specs: str | None = None) -> str:
+        """Подставить характеристики в плейсхолдер {{SPECS}}."""
+        if "{{SPECS}}" not in self.prompt:
+            return self.prompt
+        value = (specs or "").strip() or self.default_specs
+        return self.prompt.replace("{{SPECS}}", value)
 
 
 def _mode_refs(key: str) -> list[Path]:
-    """Эталоны режима: reference/<key>/etalon_1.png, etalon_2.png."""
-    return [
-        REFERENCE_DIR / key / "etalon_1.png",
-        REFERENCE_DIR / key / "etalon_2.png",
-    ]
+    """Все эталоны режима: reference/<key>/etalon_*.png в алфавитном порядке."""
+    folder = REFERENCE_DIR / key
+    if not folder.exists():
+        return []
+    return sorted(folder.glob("etalon_*.png"))
 
 
-_RITUAL_PROMPT = """Я прикрепил 3 фото:
-
-- Фото 1 и Фото 2 — ЭТАЛОНЫ СТИЛЯ карточки товара (как должна выглядеть готовая карточка для сайта). Светло-серый студийный фон с премиальным градиентом, заголовок "РИТУАЛЬНАЯ КОМПОЗИЦИЯ" зелёным сверху, подзаголовок "ПРЕМИАЛЬНОЕ ИСПОЛНЕНИЕ", три бейджа снизу.
-- Фото 3 — ИСХОДНЫЙ ТОВАР (снят в произвольной обстановке), который нужно поместить на новую карточку.
-
-Задача: сгенерируй ПРЕМИАЛЬНУЮ КАРТОЧКУ ТОВАРА на основе ИСХОДНОГО фото (фото 3), оформив её в едином стиле с эталонами (фото 1 и фото 2). Эталоны — это ТОЛЬКО референс стиля, фона, типографики и компоновки. НЕ переноси с них сам товар.
-
-ВАЖНО:
-1. Товар с фото 3 сохрани АБСОЛЮТНО ИДЕНТИЧНО: те же цветы, тот же декор, ленты, бабочки, мишура — все элементы, которые есть на исходном фото. Не заменяй товар на тот, что на эталонах. Не добавляй и не убирай ни один элемент товара.
-2. Убери ВСЁ лишнее с фона (мебель, стены, плинтус, любую домашнюю обстановку).
-3. Размести товар по центру кадра.
-4. Сделай чистый студийный светло-графитовый фон с мягким премиальным градиентом — как на эталонах.
-5. Сверху размести заголовок "РИТУАЛЬНАЯ КОМПОЗИЦИЯ" (зелёным цветом), декоративный разделитель и подзаголовок "ПРЕМИАЛЬНОЕ ИСПОЛНЕНИЕ".
-6. Снизу — три бейджа с иконками и подписями: "АККУРАТНЫЙ ДЕКОР", "ВЫРАЗИТЕЛЬНАЯ КОМПОЗИЦИЯ", "ЭЛЕГАНТНАЯ ПОДАЧА".
-7. Формат 1:1 (квадрат), стиль современный, дорогой, минималистичный, каталожный. Без шумов, без посторонних теней, без визуального мусора.
-8. Финал должен выглядеть как качественная единая карточка товара для сайта, в одной серии с эталонами.
-
-Сгенерируй итоговое изображение."""
-
-
-_WREATH_PROMPT = os.getenv(
-    "WREATH_PROMPT",
-    # TODO: заполните когда создадите ChatGPT-проект для венков.
-    # Шаблон ниже — ритуальный, отредактируйте под венки (заголовки, бейджи).
-    _RITUAL_PROMPT,
-)
-
-_CONDITIONER_PROMPT = os.getenv(
-    "CONDITIONER_PROMPT",
-    # TODO: заполните когда создадите ChatGPT-проект для кондиционеров.
-    "Сгенерируй премиальную карточку товара для кондиционера на основе исходного фото. "
-    "Чистый студийный фон, товар по центру, формат 1:1, в стиле эталонов из проекта.",
-)
+def _mode_prompt(key: str, env_var: str, fallback: str = "") -> str:
+    """
+    Промпт читается в порядке приоритета:
+      1) prompts/<key>.txt — основной способ (длинные многострочные тексты)
+      2) переменная окружения <env_var> — для оперативной правки без файла
+      3) fallback (пустая строка → режим помечается как НЕ настроен)
+    """
+    prompt_file = PROMPTS_DIR / f"{key}.txt"
+    if prompt_file.exists():
+        return prompt_file.read_text(encoding="utf-8").strip()
+    return os.getenv(env_var, fallback).strip()
 
 
 MODES: dict[str, Mode] = {
@@ -114,11 +109,10 @@ MODES: dict[str, Mode] = {
         label="🧺 Корзинки",
         project_url=os.getenv(
             "RITUAL_PROJECT_URL",
-            # совместимость со старой переменной CHATGPT_PROJECT_URL
-            os.getenv("CHATGPT_PROJECT_URL", ""),
+            os.getenv("CHATGPT_PROJECT_URL", ""),  # совместимость
         ).strip(),
         reference_files=_mode_refs("ritual"),
-        prompt=_RITUAL_PROMPT,
+        prompt=_mode_prompt("ritual", "RITUAL_PROMPT"),
         enabled=True,
     ),
     "wreath": Mode(
@@ -126,16 +120,28 @@ MODES: dict[str, Mode] = {
         label="⚜️ Венки",
         project_url=os.getenv("WREATH_PROJECT_URL", "").strip(),
         reference_files=_mode_refs("wreath"),
-        prompt=_WREATH_PROMPT,
-        enabled=True,  # сам режим включён, но is_configured=False пока нет URL+эталонов
+        prompt=_mode_prompt("wreath", "WREATH_PROMPT"),
+        enabled=True,
     ),
     "conditioner": Mode(
         key="conditioner",
         label="❄️ Кондиционеры",
         project_url=os.getenv("CONDITIONER_PROJECT_URL", "").strip(),
         reference_files=_mode_refs("conditioner"),
-        prompt=_CONDITIONER_PROMPT,
+        prompt=_mode_prompt("conditioner", "CONDITIONER_PROMPT"),
         enabled=True,
+        requires_specs=True,
+        default_specs=(
+            "Автоматическое качание заслонок\n"
+            "Режим «Комфортный сон»\n"
+            "Автоматическая очистка теплообменника\n"
+            "Тёплый пуск\n"
+            "Многоступенчатая очистка воздуха\n"
+            "Фильтр высокой степени очистки\n"
+            "Антикоррозийное покрытие теплообменника\n"
+            "Защита от коррозии\n"
+            "Wi-Fi Control — опция"
+        ),
     ),
 }
 

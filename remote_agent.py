@@ -166,9 +166,12 @@ async def agent_loop(api_url: str) -> None:
                 r.raise_for_status()
                 job = r.json()
                 job_id, input_filename = job["id"], job["input_filename"]
-                # mode может отсутствовать в старых задачах — fallback на default
                 job_mode = job.get("mode") or "ritual"
-                log.info("Задача %d (mode=%s): %s", job_id, job_mode, input_filename)
+                job_specs = job.get("specs") or None
+                log.info(
+                    "Задача %d (mode=%s, specs=%d симв.): %s",
+                    job_id, job_mode, len(job_specs or ""), input_filename,
+                )
 
                 # --- Скачиваем входной файл ---
                 r = await client.get(f"{api_url}/api/input/{job_id}", headers=headers)
@@ -189,7 +192,9 @@ async def agent_loop(api_url: str) -> None:
                                 await asyncio.sleep(15)
 
                             # --- Обрабатываем через ChatGPT ---
-                            output_path = await process_one_file(tmp_input, mode=job_mode)
+                            output_path = await process_one_file(
+                                tmp_input, mode=job_mode, specs=job_specs,
+                            )
                             log.info("Обработано → %s", output_path)
                             last_error = None
                             break  # успех
