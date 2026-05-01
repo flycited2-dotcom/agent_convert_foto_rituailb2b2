@@ -456,6 +456,46 @@ async def cmd_request_specs(update: Update, _: ContextTypes.DEFAULT_TYPE) -> Non
     )
 
 
+# Инструкция по вводу характеристик зависит от режима
+_SPECS_INSTRUCTIONS: dict[str, str] = {
+    "conditioner": (
+        "Первая строка — бренд/производитель (для имени файла).\n"
+        "Вторая строка — модель.\n"
+        "Далее — преимущества, по одному на строку.\n\n"
+        "Пример:\n"
+        "Midea\n"
+        "MSAC-12HRN1\n"
+        "Инверторный компрессор\n"
+        "Wi-Fi управление\n"
+        "Класс A++"
+    ),
+    "mcp": (
+        "Первая строка — полное название товара (для имени файла).\n"
+        "Далее — название, короткая строка и список характеристик.\n\n"
+        "Пример:\n"
+        "Samsung Galaxy A55 5G 8/256GB\n"
+        "Название товара: Samsung Galaxy A55 5G 8/256GB\n"
+        "Короткая строка: 8 ядер • 5000mAh • 50Мп\n"
+        "Характеристики:\n"
+        "- 8-ядерный процессор Exynos 1480\n"
+        "- Аккумулятор 5000mAh\n"
+        "- Камера 50 Мп"
+    ),
+    "kbt": (
+        "Первая строка — полное название товара (для имени файла).\n"
+        "Далее — название, короткая строка и список характеристик.\n\n"
+        "Пример:\n"
+        "LG LRSOS2706S Side-by-Side\n"
+        "Название товара: LG LRSOS2706S Side-by-Side\n"
+        "Короткая строка: 635л • No Frost • Wi-Fi\n"
+        "Характеристики:\n"
+        "- Объём 635 литров\n"
+        "- No Frost, автоматическая разморозка\n"
+        "- Wi-Fi управление через приложение"
+    ),
+}
+
+
 async def _ask_specs_for_mode(query_or_msg, chat_id: int, mode: str) -> None:
     """Показать ForceReply-приглашение для конкретного режима."""
     current = get_user_specs(chat_id, mode)
@@ -464,12 +504,10 @@ async def _ask_specs_for_mode(query_or_msg, chat_id: int, mode: str) -> None:
         f"\n\nСейчас сохранено ({len(current)} симв.):\n{current[:300]}{'…' if len(current) > 300 else ''}"
         if current else "\n\n(Пока не задано.)"
     )
+    instructions = _SPECS_INSTRUCTIONS.get(mode, _SPECS_INSTRUCTIONS["conditioner"])
     text = (
         f"{SPECS_PROMPT_HEADER} — {label}\n\n"
-        "Ответь на это сообщение списком характеристик.\n"
-        "Первая строка — бренд/производитель (для имени файла).\n"
-        "Вторая строка — модель.\n"
-        "Далее — преимущества для плашек на карточке."
+        f"Ответь на это сообщение:\n{instructions}"
         f"{current_block}\n\n"
         "Чтобы сбросить — ответь словом «сброс»."
     )
