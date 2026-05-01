@@ -275,13 +275,75 @@ async def download_via_anchor(
     )
 
 
-def make_output_path() -> Path:
+# Префикс файла для каждого режима если бренд+модель не заданы
+_MODE_FILE_PREFIX = {
+    "ritual":      "korzinka",
+    "wreath":      "venok",
+    "conditioner": "konditsioner",
+    "mcp":         "mbt",
+    "kbt":         "kbt",
+}
+
+# Кириллица → латиница (простой транслит, ГОСТ-подобный)
+_TRANSLIT = {
+    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "yo",
+    "ж": "zh", "з": "z", "и": "i", "й": "y", "к": "k", "л": "l", "м": "m",
+    "н": "n", "о": "o", "п": "p", "р": "r", "с": "s", "т": "t", "у": "u",
+    "ф": "f", "х": "kh", "ц": "ts", "ч": "ch", "ш": "sh", "щ": "shch",
+    "ъ": "", "ы": "y", "ь": "", "э": "e", "ю": "yu", "я": "ya",
+}
+
+
+def slugify(s: str | None, max_len: int = 40) -> str:
+    """Превращает строку (вкл. кириллицу) в безопасный slug для имени файла:
+    латиница, цифры, дефис, подчёркивание. Пустая строка если None/мусор."""
+    if not s:
+        return ""
+    s = s.strip().lower()
+    out = []
+    for ch in s:
+        if ch in _TRANSLIT:
+            out.append(_TRANSLIT[ch])
+        elif ch.isascii() and (ch.isalnum() or ch in "-_"):
+            out.append(ch)
+        elif ch in " \t/\\.":
+            out.append("-")
+        # остальное (символы, эмодзи) выкидываем
+    result = "".join(out)
+    # Сворачиваем повторы дефисов/подчёркиваний
+    while "--" in result:
+        result = result.replace("--", "-")
+    while "__" in result:
+        result = result.replace("__", "_")
+    return result.strip("-_")[:max_len]
+
+
+def make_output_path(
+    mode: str = DEFAULT_MODE,
+    brand: str | None = None,
+    model: str | None = None,
+) -> Path:
+    """Имя готового файла: <brand>_<model>_<date>_<seq>.png если задан бренд+модель,
+    иначе <mode_prefix>_<date>_<seq>.png (например split_2026-04-30_001.png).
+
+    Префикс по режиму: korzinka / venok / split (или сам ключ режима).
+    seq — порядковый номер в текущем дне для конкретного префикса."""
     now = datetime.now()
     date_part = now.strftime("%Y-%m-%d")
-    time_part = now.strftime("%H-%M-%S")
-    existing = list(OUTPUT_DIR.glob(f"ritual_{date_part}_*.png"))
+
+    brand_s = slugify(brand)
+    model_s = slugify(model)
+
+    if brand_s and model_s:
+        prefix = f"{brand_s}_{model_s}"
+    elif brand_s:
+        prefix = brand_s
+    else:
+        prefix = _MODE_FILE_PREFIX.get(mode, mode)
+
+    existing = list(OUTPUT_DIR.glob(f"{prefix}_{date_part}_*.png"))
     seq = len(existing) + 1
-    return OUTPUT_DIR / f"ritual_{date_part}_{time_part}_{seq:03d}.png"
+    return OUTPUT_DIR / f"{prefix}_{date_part}_{seq:03d}.png"
 
 
 def archive_input(file_path: Path) -> Path:
@@ -295,6 +357,8 @@ async def process_one_file(
     file_path: Path,
     mode: str = DEFAULT_MODE,
     specs: str | None = None,
+    brand: str | None = None,
+    model: str | None = None,
 ) -> Path:
     cfg = get_mode(mode)
     if not cfg.is_configured:
@@ -305,12 +369,12 @@ async def process_one_file(
         )
 
     rendered_prompt = cfg.render_prompt(specs)
-    output_path = make_output_path()
+    output_path = make_output_path(mode=cfg.key, brand=brand, model=model)
     chat_url = cfg.project_url or "https://chatgpt.com/"
     log.info(
-        "=== Обработка: %s → %s (mode: %s, specs: %d симв., url: %s) ===",
+        "=== Обработка: %s → %s (mode: %s, brand=%s, model=%s, specs: %d симв.) ===",
         file_path.name, output_path.name, cfg.key,
-        len(specs or ""), chat_url,
+        brand or "-", model or "-", len(specs or ""),
     )
 
     async with async_playwright() as p:

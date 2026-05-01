@@ -39,7 +39,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("remote_agent")
 
-from config import DELAY_BETWEEN_JOBS_SEC, GDRIVE_CREDENTIALS_JSON, GDRIVE_FOLDER_ID  # noqa: E402
+from config import DELAY_BETWEEN_JOBS_SEC, GDRIVE_CREDENTIALS_JSON, GDRIVE_FOLDER_ID, get_mode  # noqa: E402
 from agent import process_one_file  # noqa: E402
 
 # --- SSH / API config (из .env) ---
@@ -166,11 +166,14 @@ async def agent_loop(api_url: str) -> None:
                 r.raise_for_status()
                 job = r.json()
                 job_id, input_filename = job["id"], job["input_filename"]
-                job_mode = job.get("mode") or "ritual"
+                job_mode  = job.get("mode") or "ritual"
                 job_specs = job.get("specs") or None
+                job_brand = job.get("brand") or None
+                job_model = job.get("model") or None
                 log.info(
-                    "Задача %d (mode=%s, specs=%d симв.): %s",
-                    job_id, job_mode, len(job_specs or ""), input_filename,
+                    "Задача %d (mode=%s, brand=%s, model=%s, specs=%d симв.): %s",
+                    job_id, job_mode, job_brand or "-", job_model or "-",
+                    len(job_specs or ""), input_filename,
                 )
 
                 # --- Скачиваем входной файл ---
@@ -194,6 +197,7 @@ async def agent_loop(api_url: str) -> None:
                             # --- Обрабатываем через ChatGPT ---
                             output_path = await process_one_file(
                                 tmp_input, mode=job_mode, specs=job_specs,
+                                brand=job_brand, model=job_model,
                             )
                             log.info("Обработано → %s", output_path)
                             last_error = None
@@ -217,24 +221,29 @@ async def agent_loop(api_url: str) -> None:
                             pass
                     else:
                         # --- Загружаем на Google Drive (если настроено) ---
-                        if GDRIVE_CREDENTIALS_JSON and GDRIVE_FOLDER_ID:
+                        # Папка по режиму, fallback на общую GDRIVE_FOLDER_ID.
+                        mode_cfg = get_mode(job_mode)
+                        target_folder = mode_cfg.gdrive_folder_id or GDRIVE_FOLDER_ID
+                        if GDRIVE_CREDENTIALS_JSON and target_folder:
                             try:
                                 from gdrive import upload_file as gdrive_upload
                                 link = await asyncio.get_event_loop().run_in_executor(
                                     None, gdrive_upload, output_path,
-                                    GDRIVE_FOLDER_ID, GDRIVE_CREDENTIALS_JSON,
+                                    target_folder, GDRIVE_CREDENTIALS_JSON,
                                 )
-                                log.info("Google Drive: %s", link)
+                                log.info("Google Drive (%s): %s", job_mode, link)
                             except Exception as gde:
                                 log.warning("Google Drive upload failed: %s", gde)
 
                         # --- Загружаем результат на VPS ---
+                        # Передаём ИМЕННО локальное имя файла (с brand/model)
+                        # — VPS сохранит под ним же.
                         async with httpx.AsyncClient(timeout=120, trust_env=False) as up:
                             with open(output_path, "rb") as f:
                                 r = await up.post(
                                     f"{api_url}/api/complete/{job_id}",
                                     headers=headers,
-                                    files={"result": ("result.png", f, "image/png")},
+                                    files={"result": (output_path.name, f, "image/png")},
                                 )
                         r.raise_for_status()
                         log.info("Загружено на VPS: %s", r.json())

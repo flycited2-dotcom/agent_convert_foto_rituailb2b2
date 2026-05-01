@@ -60,11 +60,15 @@ def next_job(x_agent_token: str = Header(...)):
     keys = row.keys()
     mode  = (row["mode"]  if "mode"  in keys else None) or "ritual"
     specs = (row["specs"] if "specs" in keys else None) or ""
+    brand = (row["brand"] if "brand" in keys else None) or ""
+    model = (row["model"] if "model" in keys else None) or ""
     return {
         "id": row["id"],
         "input_filename": row["input_filename"],
         "mode": mode,
         "specs": specs,
+        "brand": brand,
+        "model": model,
     }
 
 
@@ -100,9 +104,22 @@ async def complete_job(
     if not row:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    # Сохраняем результат
-    ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    out_filename = f"ritual_{ts}_{job_id:03d}.png"
+    # Имя файла берём ИЗ агента (он сам вычислил его с учётом brand/model/mode).
+    # Подстраховка: если агент не передал filename или передал что-то опасное
+    # (path traversal) — fallback на старую схему.
+    incoming = (result.filename or "").strip()
+    safe_name = Path(incoming).name  # отрезает любые ../ или /
+    if safe_name and safe_name.lower().endswith(".png"):
+        out_filename = safe_name
+        # Если файл с таким именем уже есть (агент не учёл VPS-сторонние) —
+        # добавим суффикс job_id чтобы не перезатереть.
+        if (OUTPUT_DIR / out_filename).exists():
+            stem = out_filename[:-4]
+            out_filename = f"{stem}_j{job_id}.png"
+    else:
+        ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        out_filename = f"split_{ts}_{job_id:03d}.png"
+
     out_path = OUTPUT_DIR / out_filename
     out_path.write_bytes(await result.read())
 

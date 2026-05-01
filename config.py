@@ -62,6 +62,11 @@ class Mode:
     requires_specs: bool = False
     # Дефолтные характеристики, если пользователь не ввёл свои (fallback).
     default_specs: str = ""
+    # ID папки Google Drive специально для этого режима. Пусто — используется
+    # общая GDRIVE_FOLDER_ID для всех режимов.
+    gdrive_folder_id: str = ""
+    # ID Telegram-канала для пересылки готовых карточек. Пусто — не пересылаем.
+    telegram_channel_id: str = ""
 
     @property
     def is_configured(self) -> bool:
@@ -114,6 +119,8 @@ MODES: dict[str, Mode] = {
         reference_files=_mode_refs("ritual"),
         prompt=_mode_prompt("ritual", "RITUAL_PROMPT"),
         enabled=True,
+        gdrive_folder_id=os.getenv("RITUAL_GDRIVE_FOLDER_ID", "").strip(),
+        telegram_channel_id=os.getenv("RITUAL_TELEGRAM_CHANNEL_ID", "").strip(),
     ),
     "wreath": Mode(
         key="wreath",
@@ -122,6 +129,8 @@ MODES: dict[str, Mode] = {
         reference_files=_mode_refs("wreath"),
         prompt=_mode_prompt("wreath", "WREATH_PROMPT"),
         enabled=True,
+        gdrive_folder_id=os.getenv("WREATH_GDRIVE_FOLDER_ID", "").strip(),
+        telegram_channel_id=os.getenv("WREATH_TELEGRAM_CHANNEL_ID", "").strip(),
     ),
     "conditioner": Mode(
         key="conditioner",
@@ -131,9 +140,6 @@ MODES: dict[str, Mode] = {
         prompt=_mode_prompt("conditioner", "CONDITIONER_PROMPT"),
         enabled=True,
         requires_specs=True,
-        # Универсальные дефолтные характеристики (используются ТОЛЬКО если
-        # пользователь не нажал «📝 Характеристики» и не ввёл свой список).
-        # На практике для каждого кондиционера нужно вводить свои.
         default_specs=(
             "Инверторный компрессор\n"
             "Класс энергоэффективности A++\n"
@@ -143,6 +149,32 @@ MODES: dict[str, Mode] = {
             "Антикоррозионное покрытие\n"
             "Wi-Fi управление (опция)"
         ),
+        gdrive_folder_id=os.getenv("CONDITIONER_GDRIVE_FOLDER_ID", "").strip(),
+        telegram_channel_id=os.getenv("CONDITIONER_TELEGRAM_CHANNEL_ID", "").strip(),
+    ),
+    "mcp": Mode(
+        key="mcp",
+        label="📦 МБТ",
+        project_url=os.getenv("MCP_PROJECT_URL", "").strip(),
+        reference_files=_mode_refs("mcp"),
+        prompt=_mode_prompt("mcp", "MCP_PROMPT"),
+        enabled=True,
+        requires_specs=True,
+        default_specs="",
+        gdrive_folder_id=os.getenv("MCP_GDRIVE_FOLDER_ID", "").strip(),
+        telegram_channel_id=os.getenv("MCP_TELEGRAM_CHANNEL_ID", "").strip(),
+    ),
+    "kbt": Mode(
+        key="kbt",
+        label="🏠 КБТ",
+        project_url=os.getenv("KBT_PROJECT_URL", "").strip(),
+        reference_files=_mode_refs("kbt"),
+        prompt=_mode_prompt("kbt", "KBT_PROMPT"),
+        enabled=True,
+        requires_specs=True,
+        default_specs="",
+        gdrive_folder_id=os.getenv("KBT_GDRIVE_FOLDER_ID", "").strip(),
+        telegram_channel_id=os.getenv("KBT_TELEGRAM_CHANNEL_ID", "").strip(),
     ),
 }
 

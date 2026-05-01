@@ -37,6 +37,8 @@ from telegram.ext import (
     filters,
 )
 
+import os as _os
+
 from config_vps import (
     DB_PATH,
     FAILED_DIR,
@@ -47,6 +49,15 @@ from config_vps import (
     TELEGRAM_ALLOWED_USER_ID,
     TELEGRAM_BOT_TOKEN,
 )
+
+# Telegram-каналы для пересылки результатов по режиму (берём из .env VPS)
+MODES_CHANNELS: dict[str, str] = {
+    "ritual":      _os.getenv("RITUAL_TELEGRAM_CHANNEL_ID", "").strip(),
+    "wreath":      _os.getenv("WREATH_TELEGRAM_CHANNEL_ID", "").strip(),
+    "conditioner": _os.getenv("CONDITIONER_TELEGRAM_CHANNEL_ID", "").strip(),
+    "mcp":         _os.getenv("MCP_TELEGRAM_CHANNEL_ID", "").strip(),
+    "kbt":         _os.getenv("KBT_TELEGRAM_CHANNEL_ID", "").strip(),
+}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -71,19 +82,29 @@ MODES_LABELS: dict[str, str] = {
     "ritual":      "🧺 Корзинки",
     "wreath":      "⚜️ Венки",
     "conditioner": "❄️ Кондиционеры",
+    "mcp":         "📦 МБТ",
+    "kbt":         "🏠 КБТ",
 }
 DEFAULT_MODE = "ritual"
 MODE_BY_LABEL = {v: k for k, v in MODES_LABELS.items()}
 
 # Какие режимы требуют ввод характеристик пользователем перед генерацией.
 # Должен совпадать с requires_specs в локальном config.py агента.
-MODES_WITH_SPECS = {"conditioner"}
+MODES_WITH_SPECS = {"conditioner", "mcp", "kbt"}
 
 # Маркер сообщения-приглашения ввести характеристики. Telegram не отдаёт
 # нам напрямую "это reply на ForceReply", но мы можем узнать ответ по
 # message.reply_to_message.text — сравнивая с этим уникальным заголовком.
-SPECS_PROMPT_HEADER = "📝 Характеристики кондиционера"
+SPECS_PROMPT_HEADER = "📝 Характеристики товара"
 BTN_SPECS = "📝 Характеристики"
+
+# Inline-клавиатура выбора режима для ввода характеристик
+def _specs_mode_keyboard() -> InlineKeyboardMarkup:
+    buttons = [
+        [InlineKeyboardButton(MODES_LABELS[m], callback_data=f"specs_mode:{m}")]
+        for m in MODES_WITH_SPECS
+    ]
+    return InlineKeyboardMarkup(buttons)
 
 
 # ---------------------------------------------------------------------------
@@ -119,6 +140,8 @@ def init_db() -> None:
             "ALTER TABLE jobs ADD COLUMN failed_filename TEXT",
             "ALTER TABLE jobs ADD COLUMN mode TEXT NOT NULL DEFAULT 'ritual'",
             "ALTER TABLE jobs ADD COLUMN specs TEXT",
+            "ALTER TABLE jobs ADD COLUMN brand TEXT",
+            "ALTER TABLE jobs ADD COLUMN model TEXT",
         ):
             try:
                 conn.execute(ddl)
@@ -163,25 +186,108 @@ def set_user_mode(chat_id: int, mode: str) -> None:
         conn.commit()
 
 
-def get_user_specs(chat_id: int) -> str | None:
-    """Текущий черновик характеристик пользователя (используется для следующего фото)."""
+def get_user_specs(chat_id: int, mode: str | None = None) -> str | None:
+    """Характеристики пользователя для конкретного режима (или текущего)."""
+    if mode is None:
+        mode = get_user_mode(chat_id)
     with db_conn() as conn:
         row = conn.execute(
             "SELECT pending_specs FROM user_state WHERE chat_id=?", (chat_id,)
         ).fetchone()
-    return (row["pending_specs"] if row and row["pending_specs"] else None)
+    if not row or not row["pending_specs"]:
+        return None
+    try:
+        import json
+        data = json.loads(row["pending_specs"])
+        return data.get(mode) or None
+    except Exception:
+        # Старый формат — строка без JSON (обратная совместимость)
+        return row["pending_specs"] or None
 
 
-def set_user_specs(chat_id: int, specs: str | None) -> None:
+def set_user_specs(chat_id: int, specs: str | None, mode: str | None = None) -> None:
+    if mode is None:
+        mode = get_user_mode(chat_id)
+    import json
+    # Читаем текущий JSON
+    with db_conn() as conn:
+        row = conn.execute(
+            "SELECT pending_specs FROM user_state WHERE chat_id=?", (chat_id,)
+        ).fetchone()
+    try:
+        data = json.loads(row["pending_specs"]) if row and row["pending_specs"] else {}
+        if not isinstance(data, dict):
+            data = {}
+    except Exception:
+        data = {}
+    if specs:
+        data[mode] = specs
+    else:
+        data.pop(mode, None)
+    new_val = json.dumps(data, ensure_ascii=False) if data else None
     with db_conn() as conn:
         conn.execute(
             "INSERT INTO user_state (chat_id, mode, pending_specs, updated_at) "
             "VALUES (?, ?, ?, ?) "
             "ON CONFLICT(chat_id) DO UPDATE SET "
             "pending_specs=excluded.pending_specs, updated_at=excluded.updated_at",
-            (chat_id, DEFAULT_MODE, specs, datetime.now().isoformat()),
+            (chat_id, DEFAULT_MODE, new_val, datetime.now().isoformat()),
         )
         conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Извлечение бренда/модели из текста характеристик
+# ---------------------------------------------------------------------------
+# Юзер может написать в начале списка characteristics:
+#   Бренд: Midea
+#   Модель: MSAC-12HRN1
+#   <дальше преимущества>
+# Эти строки выделяются для имени файла, а из специй удаляются (чтобы они
+# не попали в плашки преимуществ на карточке).
+
+_BRAND_PREFIXES = ("бренд:", "brand:", "марка:", "производитель:")
+_MODEL_PREFIXES = ("модель:", "model:")
+
+
+def parse_brand_model(specs: str | None) -> tuple[str | None, str | None, str]:
+    """Возвращает (brand, model, cleaned_specs).
+
+    Сначала ищет строки 'Бренд: X' / 'Модель: X'.
+    Если не найдено — берёт первую строку как brand, вторую как model.
+    cleaned_specs всегда содержит полный текст (для подстановки в промпт).
+    """
+    if not specs:
+        return None, None, ""
+    brand: str | None = None
+    model: str | None = None
+    kept_lines: list[str] = []
+    for raw in specs.splitlines():
+        line = raw.rstrip()
+        low = line.lstrip().lower()
+        matched = False
+        for pref in _BRAND_PREFIXES:
+            if low.startswith(pref):
+                brand = line.split(":", 1)[1].strip()
+                matched = True
+                break
+        if not matched:
+            for pref in _MODEL_PREFIXES:
+                if low.startswith(pref):
+                    model = line.split(":", 1)[1].strip()
+                    matched = True
+                    break
+        if not matched:
+            kept_lines.append(line)
+    # Fallback: если не нашли Бренд:/Модель: — первые две строки
+    if brand is None and model is None:
+        nonempty = [l.strip() for l in specs.splitlines() if l.strip()]
+        if nonempty:
+            brand = nonempty[0]
+        if len(nonempty) >= 2:
+            model = nonempty[1]
+    cleaned = specs.strip()  # полный текст идёт в промпт
+    return (brand or None, model or None, cleaned)
 
 
 # ---------------------------------------------------------------------------
@@ -201,15 +307,19 @@ def _allowed(user_id: int | None) -> bool:
 BTN_STATUS  = "📊 Статус"
 BTN_CLEAR   = "❌ Очистить очередь"
 BTN_RESTART = "♻️ Рестарт зависших"
+BTN_HIDE    = "🔙 Скрыть меню"
 
 # Reply-клавиатура: режимы / характеристики+статус / действия.
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
         [KeyboardButton(MODES_LABELS["ritual"]),
-         KeyboardButton(MODES_LABELS["wreath"]),
-         KeyboardButton(MODES_LABELS["conditioner"])],
+         KeyboardButton(MODES_LABELS["wreath"])],
+        [KeyboardButton(MODES_LABELS["conditioner"]),
+         KeyboardButton(MODES_LABELS["mcp"])],
+        [KeyboardButton(MODES_LABELS["kbt"])],
         [KeyboardButton(BTN_SPECS), KeyboardButton(BTN_STATUS)],
         [KeyboardButton(BTN_CLEAR), KeyboardButton(BTN_RESTART)],
+        [KeyboardButton(BTN_HIDE)],
     ],
     resize_keyboard=True,
     is_persistent=True,
@@ -337,33 +447,44 @@ async def cmd_restart_stuck(update: Update, _: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 async def cmd_request_specs(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
-    """Пользователь нажал «📝 Характеристики» — просим ответить на это сообщение
-    списком характеристик. Связь устанавливается через ForceReply: ответ Telegram
-    автоматически прикрепит к нему reply_to_message, по тексту которого мы
-    распознаем «это специи»."""
+    """Пользователь нажал «📝 Характеристики» — показываем выбор режима."""
     if not update.effective_user or not _allowed(update.effective_user.id):
         return
-    current = get_user_specs(update.effective_chat.id)
-    current_block = (
-        f"\n\nСейчас сохранено:\n{current}" if current else
-        "\n\n(Пока не задано — будет использован дефолтный список.)"
-    )
     await update.message.reply_text(
-        f"{SPECS_PROMPT_HEADER}\n\n"
-        "Ответьте на это сообщение списком характеристик — каждая на отдельной строке. "
-        "Они подставятся в промпт при следующей генерации в режиме «❄️ Кондиционеры»."
-        f"{current_block}\n\n"
-        "Пример:\n"
-        "Инверторный компрессор\n"
-        "Класс энергоэффективности A++\n"
-        "Уровень шума 22 дБ\n"
-        "Площадь до 25 м²",
-        reply_markup=ForceReply(selective=True, input_field_placeholder="Список характеристик…"),
+        "Выбери режим, для которого хочешь задать характеристики:",
+        reply_markup=_specs_mode_keyboard(),
     )
+
+
+async def _ask_specs_for_mode(query_or_msg, chat_id: int, mode: str) -> None:
+    """Показать ForceReply-приглашение для конкретного режима."""
+    current = get_user_specs(chat_id, mode)
+    label = MODES_LABELS.get(mode, mode)
+    current_block = (
+        f"\n\nСейчас сохранено ({len(current)} симв.):\n{current[:300]}{'…' if len(current) > 300 else ''}"
+        if current else "\n\n(Пока не задано.)"
+    )
+    text = (
+        f"{SPECS_PROMPT_HEADER} — {label}\n\n"
+        "Ответь на это сообщение списком характеристик.\n"
+        "Первая строка — бренд/производитель (для имени файла).\n"
+        "Вторая строка — модель.\n"
+        "Далее — преимущества для плашек на карточке."
+        f"{current_block}\n\n"
+        "Чтобы сбросить — ответь словом «сброс»."
+    )
+    if hasattr(query_or_msg, 'message'):
+        await query_or_msg.message.reply_text(
+            text, reply_markup=ForceReply(selective=True, input_field_placeholder="Бренд: …")
+        )
+    else:
+        await query_or_msg.reply_text(
+            text, reply_markup=ForceReply(selective=True, input_field_placeholder="Бренд: …")
+        )
 
 
 async def on_specs_reply(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
-    """Reply на сообщение-приглашение — сохраняем введённые характеристики."""
+    """Reply на ForceReply-приглашение — сохраняем характеристики для нужного режима."""
     msg = update.message
     if not msg or not msg.text:
         return
@@ -373,21 +494,30 @@ async def on_specs_reply(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     if not text:
         return
 
-    # Команда сброса
+    # Определяем режим из заголовка родительского сообщения
+    parent_text = (msg.reply_to_message.text or "") if msg.reply_to_message else ""
+    mode = None
+    for m, label in MODES_LABELS.items():
+        if label in parent_text:
+            mode = m
+            break
+    if mode is None:
+        mode = get_user_mode(msg.chat_id)
+
     if text.lower() in ("сброс", "reset", "очистить", "clear"):
-        set_user_specs(update.effective_chat.id, None)
+        set_user_specs(msg.chat_id, None, mode)
         await msg.reply_text(
-            "🗑 Характеристики сброшены. Будет использован дефолтный список из промпта.",
+            f"🗑 Характеристики для «{MODES_LABELS.get(mode, mode)}» сброшены.",
             reply_markup=MAIN_KEYBOARD,
         )
         return
 
-    set_user_specs(update.effective_chat.id, text)
+    set_user_specs(msg.chat_id, text, mode)
     await msg.reply_text(
-        f"✅ Характеристики сохранены ({len(text)} симв.).\n"
-        "При следующем фото в режиме «❄️ Кондиционеры» они будут подставлены в промпт.\n\n"
-        "Чтобы изменить — снова нажмите «📝 Характеристики».\n"
-        "Чтобы сбросить — ответьте на любое сообщение бота словом «сброс».",
+        f"✅ Характеристики для «{MODES_LABELS.get(mode, mode)}» сохранены ({len(text)} симв.).\n"
+        "Будут автоматически подставлены при следующем фото в этом режиме.\n\n"
+        "Чтобы задать другой режим — нажми «📝 Характеристики» снова.\n"
+        "Чтобы сбросить — ответь словом «сброс».",
         reply_markup=MAIN_KEYBOARD,
     )
 
@@ -432,6 +562,12 @@ async def on_keyboard_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
         await cmd_restart_stuck(update, ctx)
     elif text == BTN_SPECS:
         await cmd_request_specs(update, ctx)
+    elif text == BTN_HIDE:
+        from telegram import ReplyKeyboardRemove
+        await update.message.reply_text(
+            "Клавиатура скрыта. Напиши /start чтобы вернуть меню.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
 
 
 async def handle_photo(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
@@ -461,11 +597,14 @@ async def handle_photo(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     log.info("Сохранил: %s (%d байт)", filename, target.stat().st_size)
 
     mode = get_user_mode(msg.chat_id)
-    specs = get_user_specs(msg.chat_id) if mode in MODES_WITH_SPECS else None
+    raw_specs = get_user_specs(msg.chat_id, mode) if mode in MODES_WITH_SPECS else None
+    # Извлекаем бренд+модель из specs (для имени файла), а из самих специй убираем
+    brand, model, specs = parse_brand_model(raw_specs)
     with db_conn() as conn:
         conn.execute(
-            "INSERT INTO jobs (chat_id, input_filename, mode, specs) VALUES (?, ?, ?, ?)",
-            (msg.chat_id, filename, mode, specs),
+            "INSERT INTO jobs (chat_id, input_filename, mode, specs, brand, model) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (msg.chat_id, filename, mode, specs or None, brand, model),
         )
         conn.commit()
 
@@ -479,8 +618,13 @@ async def handle_photo(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
             "\n⚠️ Характеристики не заданы — будет использован дефолтный список. "
             "Чтобы задать свои — нажмите «📝 Характеристики»."
         )
-    elif specs:
-        specs_hint = f"\n📝 С характеристиками ({len(specs)} симв.)"
+    elif raw_specs:
+        specs_hint = f"\n📝 С характеристиками ({len(raw_specs)} симв.)"
+
+    # Информация о бренде/модели если распознали
+    if brand or model:
+        bm = " ".join(filter(None, [brand, model]))
+        specs_hint += f"\n🏷 Файл будет сохранён как: {bm}"
 
     if pending == 1:
         await msg.reply_text(
@@ -503,6 +647,12 @@ async def on_callback(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
 
     data = q.data or ""
     await q.answer()
+
+    # Выбор режима для ввода характеристик
+    if data.startswith("specs_mode:"):
+        mode = data[len("specs_mode:"):]
+        await _ask_specs_for_mode(q, q.message.chat_id, mode)
+        return
 
     # callback_data компактный: "<action>:<job_id>" — гарантированно <64 байт.
     # Имена файлов читаем из БД по job_id (Telegram limit на callback_data = 64).
@@ -644,6 +794,20 @@ async def result_sender(app: Application) -> None:
                         conn.execute("UPDATE jobs SET result_sent=1 WHERE id=?", (row["id"],))
                         conn.commit()
                     log.info("Отправлено: %s → chat %s", row["output_filename"], row["chat_id"])
+
+                    # Пересылаем в канал режима
+                    channel_id = MODES_CHANNELS.get(job_mode, "")
+                    if channel_id:
+                        try:
+                            with open(out_path, "rb") as f:
+                                await app.bot.send_document(
+                                    chat_id=int(channel_id),
+                                    document=InputFile(f, filename=row["output_filename"]),
+                                    caption=row["output_filename"],
+                                )
+                            log.info("Канал %s: %s", channel_id, row["output_filename"])
+                        except Exception as e:
+                            log.warning("Ошибка отправки в канал %s: %s", channel_id, e)
                 except Exception as e:
                     log.exception("Ошибка отправки job %s: %s", row["id"], e)
 
@@ -733,7 +897,7 @@ def main() -> None:
 
     # Reply-клавиатура шлёт обычный текст — ловим точные совпадения с подписями кнопок
     import re
-    button_labels = list(MODES_LABELS.values()) + [BTN_SPECS, BTN_STATUS, BTN_CLEAR, BTN_RESTART]
+    button_labels = list(MODES_LABELS.values()) + [BTN_SPECS, BTN_STATUS, BTN_CLEAR, BTN_RESTART, BTN_HIDE]
     pattern = "^(" + "|".join(re.escape(b) for b in button_labels) + ")$"
     app.add_handler(MessageHandler(
         filters.TEXT & filters.Regex(pattern),
