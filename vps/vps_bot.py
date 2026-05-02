@@ -781,6 +781,47 @@ async def on_callback(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
 # Background task: отправляем готовые и уведомляем об ошибках
 # ---------------------------------------------------------------------------
 
+async def _auto_housekeeping(app: Application) -> None:
+    """Фоновые задачи: авто-сброс зависших + авто-очистка старых файлов."""
+    tick = 0
+    while True:
+        await asyncio.sleep(60)
+        tick += 1
+        try:
+            # Каждые 5 минут: сбрасываем processing-задачи старше 10 мин
+            if tick % 5 == 0:
+                cutoff = (datetime.now() - timedelta(minutes=10)).isoformat()
+                with db_conn() as conn:
+                    n = conn.execute(
+                        "UPDATE jobs SET status='pending', updated_at=? "
+                        "WHERE status='processing' AND updated_at < ?",
+                        (datetime.now().isoformat(), cutoff),
+                    ).rowcount
+                    if n:
+                        conn.commit()
+                        log.info("Авто-сброс зависших: %d задач → pending", n)
+
+            # Раз в 6 часов: удаляем output-файлы старше 3 дней (уже отправлены)
+            if tick % 360 == 0:
+                cutoff_date = (datetime.now() - timedelta(days=3)).isoformat()
+                with db_conn() as conn:
+                    rows = conn.execute(
+                        "SELECT output_filename FROM jobs "
+                        "WHERE result_sent=1 AND output_filename IS NOT NULL AND updated_at < ?",
+                        (cutoff_date,),
+                    ).fetchall()
+                deleted = 0
+                for row in rows:
+                    p = OUTPUT_DIR / row["output_filename"]
+                    if p.exists():
+                        p.unlink(missing_ok=True)
+                        deleted += 1
+                if deleted:
+                    log.info("Авто-очистка output: удалено %d файлов", deleted)
+        except Exception as e:
+            log.warning("Housekeeping ошибка: %s", e)
+
+
 async def result_sender(app: Application) -> None:
     log.info("Result sender запущен")
     while True:
@@ -894,9 +935,21 @@ async def post_init(app: Application) -> None:
     # некоторых клиентов выглядит менее заметно.
     await app.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
 
-    # asyncio.create_task работает корректно, т.к. post_init вызывается внутри event loop
     import asyncio as _asyncio
-    _asyncio.get_event_loop().create_task(result_sender(app))
+    loop = _asyncio.get_event_loop()
+    loop.create_task(result_sender(app))
+    loop.create_task(_auto_housekeeping(app))
+
+    # Уведомление в Telegram о запуске бота
+    if TELEGRAM_ALLOWED_USER_ID:
+        try:
+            pending = _pending_count()
+            await app.bot.send_message(
+                chat_id=TELEGRAM_ALLOWED_USER_ID,
+                text=f"🟢 ФотоАгент запущен.\nВ очереди: {pending}",
+            )
+        except Exception as e:
+            log.warning("Не удалось отправить уведомление о старте: %s", e)
 
 
 # ---------------------------------------------------------------------------

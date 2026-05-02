@@ -15,8 +15,10 @@ import sqlite3
 from datetime import datetime
 from pathlib import Path
 
+import io
+
 from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from config_vps import API_TOKEN, DB_PATH, FAILED_DIR, INPUT_DIR, OUTPUT_DIR, PROCESSED_DIR
 
@@ -82,11 +84,11 @@ def get_input(job_id: int, x_agent_token: str = Header(...)):
     path = INPUT_DIR / row["input_filename"]
     if not path.exists():
         raise HTTPException(status_code=404, detail="Input file not found")
-    # FileResponse вызывал RuntimeError "Response content longer than Content-Length"
-    # Читаем файл в память и отдаём как Response — надёжнее
+    # StreamingResponse не объявляет Content-Length заранее — нет RuntimeError
+    # при больших файлах (эта ошибка была с Response(content=data))
     data = path.read_bytes()
-    return Response(
-        content=data,
+    return StreamingResponse(
+        io.BytesIO(data),
         media_type="application/octet-stream",
         headers={"Content-Disposition": f'attachment; filename="{row["input_filename"]}"'},
     )
