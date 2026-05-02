@@ -323,13 +323,11 @@ def make_output_path(
     brand: str | None = None,
     model: str | None = None,
 ) -> Path:
-    """Имя готового файла: <brand>_<model>_<date>_<seq>.png если задан бренд+модель,
-    иначе <mode_prefix>_<date>_<seq>.png (например split_2026-04-30_001.png).
-
-    Префикс по режиму: korzinka / venok / split (или сам ключ режима).
-    seq — порядковый номер в текущем дне для конкретного префикса."""
+    """Имя готового файла: <brand>_<model>_<timestamp>.png если задан бренд+модель,
+    иначе <mode_prefix>_<timestamp>.png.
+    Timestamp гарантирует уникальность при нескольких заданиях в один день."""
     now = datetime.now()
-    date_part = now.strftime("%Y-%m-%d")
+    ts = now.strftime("%Y-%m-%d_%H%M%S")
 
     brand_s = slugify(brand)
     model_s = slugify(model)
@@ -341,9 +339,7 @@ def make_output_path(
     else:
         prefix = _MODE_FILE_PREFIX.get(mode, mode)
 
-    existing = list(OUTPUT_DIR.glob(f"{prefix}_{date_part}_*.png"))
-    seq = len(existing) + 1
-    return OUTPUT_DIR / f"{prefix}_{date_part}_{seq:03d}.png"
+    return OUTPUT_DIR / f"{prefix}_{ts}.png"
 
 
 def archive_input(file_path: Path) -> Path:
