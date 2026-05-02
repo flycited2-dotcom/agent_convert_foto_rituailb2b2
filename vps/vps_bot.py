@@ -804,38 +804,12 @@ async def result_sender(app: Application) -> None:
                             conn.commit()
                         continue
 
-                    keyboard = InlineKeyboardMarkup([
-                        [InlineKeyboardButton(
-                            "🔄 Перегенерировать",
-                            callback_data=f"redo:{row['id']}",
-                        )],
-                        [InlineKeyboardButton(
-                            "🗑 Удалить (плохой)",
-                            callback_data=f"bad:{row['id']}",
-                        )],
-                    ])
-                    pending_now = _pending_count()
                     job_mode = row["mode"] if "mode" in row.keys() else DEFAULT_MODE
                     mode_label = MODES_LABELS.get(job_mode, job_mode)
-                    caption = (
-                        f"✅ Готово ({mode_label}): {row['output_filename']}\n"
-                        f"В очереди: {pending_now}"
-                    )
-                    with open(out_path, "rb") as f:
-                        await app.bot.send_document(
-                            chat_id=row["chat_id"],
-                            document=InputFile(f, filename=row["output_filename"]),
-                            caption=caption,
-                            reply_markup=keyboard,
-                        )
-                    with db_conn() as conn:
-                        conn.execute("UPDATE jobs SET result_sent=1 WHERE id=?", (row["id"],))
-                        conn.commit()
-                    log.info("Отправлено: %s → chat %s", row["output_filename"], row["chat_id"])
-
-                    # Пересылаем в канал режима
                     channel_id = MODES_CHANNELS.get(job_mode, "")
+
                     if channel_id:
+                        # Отправляем только в канал режима — без дублирования в личный чат
                         try:
                             with open(out_path, "rb") as f:
                                 await app.bot.send_document(
@@ -846,6 +820,29 @@ async def result_sender(app: Application) -> None:
                             log.info("Канал %s: %s", channel_id, row["output_filename"])
                         except Exception as e:
                             log.warning("Ошибка отправки в канал %s: %s", channel_id, e)
+                    else:
+                        # Канал не настроен — fallback в личный чат
+                        keyboard = InlineKeyboardMarkup([
+                            [InlineKeyboardButton("🔄 Перегенерировать", callback_data=f"redo:{row['id']}")],
+                            [InlineKeyboardButton("🗑 Удалить (плохой)", callback_data=f"bad:{row['id']}")],
+                        ])
+                        pending_now = _pending_count()
+                        caption = (
+                            f"✅ Готово ({mode_label}): {row['output_filename']}\n"
+                            f"В очереди: {pending_now}"
+                        )
+                        with open(out_path, "rb") as f:
+                            await app.bot.send_document(
+                                chat_id=row["chat_id"],
+                                document=InputFile(f, filename=row["output_filename"]),
+                                caption=caption,
+                                reply_markup=keyboard,
+                            )
+                        log.info("Личный чат: %s → %s", row["output_filename"], row["chat_id"])
+
+                    with db_conn() as conn:
+                        conn.execute("UPDATE jobs SET result_sent=1 WHERE id=?", (row["id"],))
+                        conn.commit()
                 except Exception as e:
                     log.exception("Ошибка отправки job %s: %s", row["id"], e)
 
