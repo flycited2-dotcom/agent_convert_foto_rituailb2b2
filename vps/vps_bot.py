@@ -289,6 +289,25 @@ def parse_brand_model(specs: str | None) -> tuple[str | None, str | None, str]:
                     break
         if not matched:
             kept_lines.append(line)
+    # Попробовать inline-паттерны "бренд XXX" и "серия XXX" (без двоеточия)
+    # Например: "Сплит-система серия Legend on\off бренд Midea"
+    if brand is None or model is None:
+        import re
+        for raw in specs.splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            if brand is None:
+                m = re.search(r'\bбренд\s+(\S+)', line, re.IGNORECASE)
+                if m:
+                    brand = m.group(1)
+            if model is None:
+                m = re.search(r'\bсери[яи]\s+(.*?)(?:\s+бренд\b|$)', line, re.IGNORECASE)
+                if m:
+                    model = m.group(1).strip()
+            if brand and model:
+                break
+
     # Fallback: если не нашли Бренд:/Модель: — первые две строки
     if brand is None and model is None:
         nonempty = [l.strip() for l in specs.splitlines() if l.strip()]
