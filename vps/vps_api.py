@@ -142,6 +142,20 @@ async def complete_job(
     return {"ok": True, "output": out_filename}
 
 
+@app.post("/api/heartbeat")
+def agent_heartbeat(x_agent_token: str = Header(...)):
+    """Агент вызывает при каждом цикле опроса — фиксируем время последнего контакта."""
+    _auth(x_agent_token)
+    with db_conn() as conn:
+        conn.execute(
+            "INSERT INTO agent_heartbeat (id, seen_at) VALUES (1, ?) "
+            "ON CONFLICT(id) DO UPDATE SET seen_at=excluded.seen_at",
+            (datetime.now().isoformat(),),
+        )
+        conn.commit()
+    return {"ok": True}
+
+
 @app.post("/api/fail/{job_id}")
 async def fail_job(
     job_id: int,

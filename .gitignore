@@ -30,3 +30,9 @@ gdrive_token.json
 gdrive_oauth_client.json
 client_secret_*.json
 foto-ritualb2b-*.json
+
+# Артефакты SSH-агентов (временные скрипты)
+ssh_run*.py
+ssh_output*.txt
+skills-lock.json
+excel-automation*.zip

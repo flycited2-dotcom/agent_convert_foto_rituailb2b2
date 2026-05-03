@@ -14,6 +14,7 @@ import asyncio
 import logging
 import shutil
 import sqlite3
+import time as _time
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -119,6 +120,7 @@ def db_conn() -> sqlite3.Connection:
 
 def init_db() -> None:
     with db_conn() as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS jobs (
                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -160,6 +162,14 @@ def init_db() -> None:
             conn.execute("ALTER TABLE user_state ADD COLUMN pending_specs TEXT")
         except Exception:
             pass
+        # Heartbeat агента — для /agent_status и алертов
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS agent_heartbeat (
+                id      INTEGER PRIMARY KEY CHECK (id = 1),
+                seen_at TIMESTAMP
+            )
+        """)
+        conn.execute("INSERT OR IGNORE INTO agent_heartbeat (id, seen_at) VALUES (1, NULL)")
         conn.commit()
 
 
@@ -342,9 +352,71 @@ def _pending_count_by_mode(mode: str) -> int:
 # Handlers
 # ---------------------------------------------------------------------------
 
+async def cmd_agent_status(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    """Показывает, онлайн ли локальный агент (по времени последнего heartbeat)."""
+    if not update.effective_user or not _allowed(update.effective_user.id):
+        return
+    with db_conn() as conn:
+        row = conn.execute("SELECT seen_at FROM agent_heartbeat WHERE id=1").fetchone()
+    if not row or not row["seen_at"]:
+        await update.message.reply_text("🔴 Агент: нет данных. Запусти remote_agent.py.", reply_markup=MAIN_KEYBOARD)
+        return
+    last = datetime.fromisoformat(row["seen_at"])
+    age = (datetime.now() - last).total_seconds()
+    if age < 30:
+        icon = "🟢"
+        label = "Онлайн"
+    elif age < 120:
+        icon = "🟡"
+        label = "Нет ответа"
+    else:
+        icon = "🔴"
+        label = "Офлайн"
+    pending = _pending_count()
+    await update.message.reply_text(
+        f"Агент: {icon} {label}\n"
+        f"Последний контакт: {int(age)} сек. назад\n"
+        f"В очереди: {pending}",
+        reply_markup=MAIN_KEYBOARD,
+    )
+
+
+async def cmd_last(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    """Показывает последние 5 готовых результатов с кнопкой перегенерации."""
+    if not update.effective_user or not _allowed(update.effective_user.id):
+        return
+    with db_conn() as conn:
+        rows = conn.execute(
+            "SELECT id, mode, output_filename, substr(updated_at,1,16) as ts "
+            "FROM jobs WHERE status='done' AND output_filename IS NOT NULL "
+            "ORDER BY id DESC LIMIT 5"
+        ).fetchall()
+    if not rows:
+        await update.message.reply_text("Нет готовых результатов.", reply_markup=MAIN_KEYBOARD)
+        return
+    lines = []
+    buttons = []
+    for row in rows:
+        label = MODES_LABELS.get(row["mode"], row["mode"])
+        lines.append(f"#{row['id']} {label} — {row['output_filename']} ({row['ts']})")
+        name_short = row["output_filename"][:28]
+        buttons.append([InlineKeyboardButton(
+            f"🔄 #{row['id']} {name_short}",
+            callback_data=f"redo:{row['id']}",
+        )])
+    await update.message.reply_text(
+        "Последние результаты:\n\n" + "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
 async def cmd_start(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.effective_user or not _allowed(update.effective_user.id):
         await update.message.reply_text("Доступ запрещён.")
+        return
+    if update.effective_chat.type != "private":
+        from telegram import ReplyKeyboardRemove
+        await update.message.reply_text("Клавиатура скрыта.", reply_markup=ReplyKeyboardRemove())
         return
     chat_id = update.effective_chat.id
     current_mode = get_user_mode(chat_id)
@@ -628,6 +700,15 @@ async def handle_photo(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
+    # Лимит очереди — не более 10 pending задач
+    user_pending = _pending_count()
+    if user_pending >= 10:
+        await msg.reply_text(
+            f"⚠️ В очереди уже {user_pending} задач. Дождись обработки или нажми «❌ Очистить очередь».",
+            reply_markup=MAIN_KEYBOARD,
+        )
+        return
+
     ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
     filename = f"tg_{ts}{ext}"
     target = INPUT_DIR / filename
@@ -781,8 +862,12 @@ async def on_callback(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
 # Background task: отправляем готовые и уведомляем об ошибках
 # ---------------------------------------------------------------------------
 
+_last_offline_alert: float = 0.0  # когда последний раз слали алерт «агент офлайн»
+
+
 async def _auto_housekeeping(app: Application) -> None:
-    """Фоновые задачи: авто-сброс зависших + авто-очистка старых файлов."""
+    """Фоновые задачи: авто-сброс зависших, очистка файлов, алерты, бэкап БД."""
+    global _last_offline_alert
     tick = 0
     while True:
         await asyncio.sleep(60)
@@ -801,6 +886,32 @@ async def _auto_housekeeping(app: Application) -> None:
                         conn.commit()
                         log.info("Авто-сброс зависших: %d задач → pending", n)
 
+            # Каждые 5 минут: алерт если очередь стоит >15 мин без агента
+            if tick % 5 == 0 and TELEGRAM_ALLOWED_USER_ID:
+                with db_conn() as conn:
+                    pending_n = conn.execute(
+                        "SELECT COUNT(*) FROM jobs WHERE status='pending'"
+                    ).fetchone()[0]
+                    hb = conn.execute(
+                        "SELECT seen_at FROM agent_heartbeat WHERE id=1"
+                    ).fetchone()
+                if pending_n > 0 and hb and hb["seen_at"]:
+                    age = (datetime.now() - datetime.fromisoformat(hb["seen_at"])).total_seconds()
+                    now_ts = _time.time()
+                    if age > 900 and (now_ts - _last_offline_alert) > 1800:
+                        _last_offline_alert = now_ts
+                        try:
+                            await app.bot.send_message(
+                                chat_id=TELEGRAM_ALLOWED_USER_ID,
+                                text=(
+                                    f"⚠️ Агент не отвечает {int(age // 60)} мин.\n"
+                                    f"В очереди: {pending_n} задач.\n"
+                                    "Запусти remote_agent.py на локальном ПК."
+                                ),
+                            )
+                        except Exception as ae:
+                            log.warning("Алерт агент-офлайн: %s", ae)
+
             # Раз в 6 часов: удаляем output-файлы старше 3 дней (уже отправлены)
             if tick % 360 == 0:
                 cutoff_date = (datetime.now() - timedelta(days=3)).isoformat()
@@ -818,6 +929,19 @@ async def _auto_housekeeping(app: Application) -> None:
                         deleted += 1
                 if deleted:
                     log.info("Авто-очистка output: удалено %d файлов", deleted)
+
+            # Раз в сутки: бэкап queue.db
+            if tick % 1440 == 0:
+                backup_dir = DB_PATH.parent / "backups"
+                backup_dir.mkdir(exist_ok=True)
+                backup_name = f"queue_{datetime.now().strftime('%Y%m%d_%H%M')}.db"
+                shutil.copy2(DB_PATH, backup_dir / backup_name)
+                # Оставляем только последние 7 бэкапов
+                old_backups = sorted(backup_dir.glob("queue_*.db"))[:-7]
+                for old in old_backups:
+                    old.unlink(missing_ok=True)
+                log.info("DB бэкап: %s", backup_name)
+
         except Exception as e:
             log.warning("Housekeeping ошибка: %s", e)
 
@@ -925,7 +1049,9 @@ async def post_init(app: Application) -> None:
     await app.bot.set_my_commands([
         BotCommand("start",         "Главное меню и режимы"),
         BotCommand("status",        "Очередь, режим, характеристики"),
-        BotCommand("specs",         "Ввести характеристики (для кондиционеров)"),
+        BotCommand("agent_status",  "Онлайн ли локальный агент"),
+        BotCommand("last",          "Последние 5 результатов + перегенерация"),
+        BotCommand("specs",         "Ввести характеристики товара"),
         BotCommand("clear",         "Снять все ожидающие задачи"),
         BotCommand("restart_stuck", "Пере-запустить зависшие (>5 мин)"),
         BotCommand("help",          "Справка"),
@@ -970,6 +1096,8 @@ def main() -> None:
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("agent_status", cmd_agent_status))
+    app.add_handler(CommandHandler("last", cmd_last))
     app.add_handler(CommandHandler("clear", cmd_clear_queue))
     app.add_handler(CommandHandler("restart_stuck", cmd_restart_stuck))
     app.add_handler(CommandHandler("specs", cmd_request_specs))

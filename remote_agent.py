@@ -158,6 +158,12 @@ async def agent_loop(api_url: str) -> None:
     async with httpx.AsyncClient(timeout=30, trust_env=False) as client:
         while True:
             try:
+                # Heartbeat — VPS фиксирует время последнего контакта агента
+                try:
+                    await client.post(f"{api_url}/api/heartbeat", headers=headers)
+                except Exception:
+                    pass
+
                 # --- Получаем следующую задачу ---
                 r = await client.get(f"{api_url}/api/next-job", headers=headers)
                 if r.status_code == 204:
@@ -268,12 +274,21 @@ def main() -> None:
         log.error("VPS_API_TOKEN не задан в .env — выход.")
         sys.exit(1)
 
-    log.info("Открываю SSH-туннель → %s:%d…", VPS_SSH_HOST, VPS_API_PORT)
-    with SSHTunnel(VPS_SSH_HOST, VPS_SSH_USER, VPS_SSH_PASS,
-                   "127.0.0.1", VPS_API_PORT) as tunnel:
-        api_url = f"http://127.0.0.1:{tunnel.local_port}"
-        log.info("Туннель активен: localhost:%d → VPS:%d", tunnel.local_port, VPS_API_PORT)
-        asyncio.run(agent_loop(api_url))
+    import time as _time_mod
+    while True:
+        try:
+            log.info("Открываю SSH-туннель → %s:%d…", VPS_SSH_HOST, VPS_API_PORT)
+            with SSHTunnel(VPS_SSH_HOST, VPS_SSH_USER, VPS_SSH_PASS,
+                           "127.0.0.1", VPS_API_PORT) as tunnel:
+                api_url = f"http://127.0.0.1:{tunnel.local_port}"
+                log.info("Туннель активен: localhost:%d → VPS:%d", tunnel.local_port, VPS_API_PORT)
+                asyncio.run(agent_loop(api_url))
+        except KeyboardInterrupt:
+            log.info("Агент остановлен (Ctrl+C).")
+            break
+        except Exception as e:
+            log.error("SSH-туннель/агент упал: %s — переподключение через 30 сек.", e)
+            _time_mod.sleep(30)
 
 
 if __name__ == "__main__":
