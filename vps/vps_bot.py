@@ -301,10 +301,13 @@ def parse_brand_model(specs: str | None) -> tuple[str | None, str | None, str]:
                 m = re.search(r'\bбренд\s+(\S+)', line, re.IGNORECASE)
                 if m:
                     brand = m.group(1)
-            if model is None:
-                m = re.search(r'\bсери[яи]\s+(.*?)(?:\s+бренд\b|$)', line, re.IGNORECASE)
-                if m:
-                    model = m.group(1).strip()
+            # "THAICON серии BALANCE on/off" → brand=THAICON, model=BALANCE on/off
+            m = re.search(r'(\S+)\s+сери[яи]\s+(.*?)(?:\s+бренд\b|$)', line, re.IGNORECASE)
+            if m:
+                if brand is None:
+                    brand = m.group(1)
+                if model is None:
+                    model = m.group(2).strip()
             if brand and model:
                 break
 
