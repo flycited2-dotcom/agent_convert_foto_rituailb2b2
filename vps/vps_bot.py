@@ -259,67 +259,125 @@ def set_user_specs(chat_id: int, specs: str | None, mode: str | None = None) -> 
 _BRAND_PREFIXES = ("бренд:", "brand:", "марка:", "производитель:")
 _MODEL_PREFIXES = ("модель:", "model:")
 
+# Типы устройств — longest first, чтобы «стиральная машина с паром»
+# матчился раньше чем «стиральная машина».
+_DEVICE_TYPES: tuple[str, ...] = tuple(sorted([
+    "стиральная машина с паром", "стиральная машина",
+    "сплит-системы", "сплит-система",
+    "кондиционер мобильный", "кондиционер",
+    "чайник электрический", "чайник",
+    "холодильник двухкамерный", "холодильник",
+    "духовка", "водонагреватель", "пылесос",
+    "телевизор", "микроволновая печь",
+], key=len, reverse=True))
+
+import re as _re
+_RE_SERIA        = _re.compile(r"(\S+)\s+сери[яи]\s+(.*)", _re.IGNORECASE)
+_RE_ZAVODA       = _re.compile(r"\bзавода\s+(\S+)", _re.IGNORECASE)
+_RE_BRAND_KW     = _re.compile(r"\bбренд\s+(\S+)", _re.IGNORECASE)
+_RE_STRIP_KW     = _re.compile(r"\s+(завода|бренд)\s+\S+\s*$", _re.IGNORECASE)
+_RE_FIRST_ALPHA  = _re.compile(r"[а-яёА-ЯЁa-zA-Z0-9]")
+
+
+def _first_text(s: str) -> str:
+    """Возвращает строку начиная с первой буквы/цифры (пропускает эмодзи и символы)."""
+    m = _RE_FIRST_ALPHA.search(s)
+    return s[m.start():] if m else ""
+
 
 def parse_brand_model(specs: str | None) -> tuple[str | None, str | None, str]:
     """Возвращает (brand, model, cleaned_specs).
 
-    Сначала ищет строки 'Бренд: X' / 'Модель: X'.
-    Если не найдено — берёт первую строку как brand, вторую как model.
-    cleaned_specs всегда содержит полный текст (для подстановки в промпт).
+    Порядок приоритетов:
+    1. Явные строки «Бренд: X» / «Модель: X»
+    2. Inline-ключевые слова «завода X», «бренд X», «серии/серия MODEL»
+    3. Тип устройства в начале первой строки («Пылесос», «Холодильник», …)
+    4. Fallback: первое слово первой осмысленной строки → brand, остальное → model
     """
     if not specs:
         return None, None, ""
     brand: str | None = None
     model: str | None = None
-    kept_lines: list[str] = []
-    for raw in specs.splitlines():
-        line = raw.rstrip()
-        low = line.lstrip().lower()
-        matched = False
-        for pref in _BRAND_PREFIXES:
-            if low.startswith(pref):
-                brand = line.split(":", 1)[1].strip()
-                matched = True
-                break
-        if not matched:
-            for pref in _MODEL_PREFIXES:
-                if low.startswith(pref):
-                    model = line.split(":", 1)[1].strip()
-                    matched = True
-                    break
-        if not matched:
-            kept_lines.append(line)
-    # Попробовать inline-паттерны "бренд XXX" и "серия XXX" (без двоеточия)
-    # Например: "Сплит-система серия Legend on\off бренд Midea"
-    if brand is None or model is None:
-        import re
-        for raw in specs.splitlines():
-            line = raw.strip()
-            if not line:
-                continue
-            if brand is None:
-                m = re.search(r'\bбренд\s+(\S+)', line, re.IGNORECASE)
-                if m:
-                    brand = m.group(1)
-            # "THAICON серии BALANCE on/off" → brand=THAICON, model=BALANCE on/off
-            m = re.search(r'(\S+)\s+сери[яи]\s+(.*?)(?:\s+бренд\b|$)', line, re.IGNORECASE)
-            if m:
-                if brand is None:
-                    brand = m.group(1)
-                if model is None:
-                    model = m.group(2).strip()
-            if brand and model:
-                break
 
-    # Fallback: если не нашли Бренд:/Модель: — первые две строки
-    if brand is None and model is None:
-        nonempty = [l.strip() for l in specs.splitlines() if l.strip()]
-        if nonempty:
-            brand = nonempty[0]
-        if len(nonempty) >= 2:
-            model = nonempty[1]
-    cleaned = specs.strip()  # полный текст идёт в промпт
-    return (brand or None, model or None, cleaned)
+    # Pass 1: явные «Бренд: X» / «Модель: X»
+    for raw in specs.splitlines():
+        low = raw.lstrip().lower()
+        for pref in _BRAND_PREFIXES:
+            if low.startswith(pref) and brand is None:
+                brand = raw.split(":", 1)[1].strip()
+        for pref in _MODEL_PREFIXES:
+            if low.startswith(pref) and model is None:
+                model = raw.split(":", 1)[1].strip()
+    if brand and model:
+        return brand, model, specs.strip()
+
+    # Pass 2: inline-ключевые слова «завода X», «бренд X», «серии/серия MODEL»
+    for raw in specs.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        z = _RE_ZAVODA.search(line)
+        if z and brand is None:
+            brand = z.group(1)
+        b = _RE_BRAND_KW.search(line)
+        if b and brand is None:
+            brand = b.group(1)
+        s = _RE_SERIA.search(line)
+        if s:
+            if model is None:
+                raw_m = _RE_STRIP_KW.sub("", s.group(2)).strip()
+                if raw_m:
+                    model = raw_m
+            if brand is None:
+                z2 = _RE_ZAVODA.search(line)
+                brand = z2.group(1) if z2 else s.group(1)
+        if brand and model:
+            break
+
+    if brand and model:
+        return brand, model, specs.strip()
+
+    # Pass 3: тип устройства в начале первой осмысленной строки
+    for raw in specs.splitlines():
+        clean = _first_text(raw)
+        if not clean:
+            continue
+        low = clean.lower()
+        for dtype in _DEVICE_TYPES:
+            if low.startswith(dtype):
+                rest = clean[len(dtype):].strip()
+                words = rest.split()
+                if words and brand is None:
+                    brand = words[0]
+                if model is None and len(words) >= 2:
+                    parts = []
+                    for w in words[1:]:
+                        if any(c in w for c in ",([<#"):
+                            break
+                        parts.append(w)
+                    if parts:
+                        model = " ".join(parts)
+                break
+        if brand:
+            break
+
+    if brand and model:
+        return brand, model, specs.strip()
+
+    # Pass 4: fallback — первое слово первой осмысленной строки → brand, остальное → model
+    for raw in specs.splitlines():
+        clean = _first_text(raw)
+        if not clean:
+            continue
+        words = clean.split()
+        if words:
+            if brand is None:
+                brand = words[0]
+            if model is None and len(words) >= 2:
+                model = " ".join(words[1:])
+            break
+
+    return (brand or None, model or None, specs.strip())
 
 
 # ---------------------------------------------------------------------------
