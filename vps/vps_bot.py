@@ -333,10 +333,11 @@ def _allowed(user_id: int | None) -> bool:
 # Reply-клавиатура: 3 кнопки быстрого доступа, всегда внизу экрана
 # ---------------------------------------------------------------------------
 
-BTN_STATUS  = "📊 Статус"
-BTN_CLEAR   = "❌ Очистить очередь"
-BTN_RESTART = "♻️ Рестарт зависших"
-BTN_HIDE    = "🔙 Скрыть меню"
+BTN_STATUS       = "📊 Статус"
+BTN_CLEAR        = "❌ Очистить очередь"
+BTN_CANCEL_LAST  = "⛔ Отменить последнее"
+BTN_RESTART      = "♻️ Рестарт зависших"
+BTN_HIDE         = "🔙 Скрыть меню"
 
 # Reply-клавиатура: режимы / характеристики+статус / действия.
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
@@ -347,7 +348,8 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
          KeyboardButton(MODES_LABELS["mcp"])],
         [KeyboardButton(MODES_LABELS["kbt"])],
         [KeyboardButton(BTN_SPECS), KeyboardButton(BTN_STATUS)],
-        [KeyboardButton(BTN_CLEAR), KeyboardButton(BTN_RESTART)],
+        [KeyboardButton(BTN_CANCEL_LAST), KeyboardButton(BTN_CLEAR)],
+        [KeyboardButton(BTN_RESTART)],
         [KeyboardButton(BTN_HIDE)],
     ],
     resize_keyboard=True,
@@ -537,6 +539,33 @@ async def cmd_restart_stuck(update: Update, _: ContextTypes.DEFAULT_TYPE) -> Non
     )
 
 
+async def cmd_cancel_last(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    """Отменяет последнее pending-задание пользователя (или любое, если одно в очереди)."""
+    if not update.effective_user or not _allowed(update.effective_user.id):
+        return
+    with db_conn() as conn:
+        row = conn.execute(
+            "SELECT id, input_filename, mode FROM jobs WHERE status='pending' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        if not row:
+            await update.message.reply_text("Нет ожидающих заданий.", reply_markup=MAIN_KEYBOARD)
+            return
+        conn.execute(
+            "UPDATE jobs SET status='cancelled', updated_at=? WHERE id=?",
+            (datetime.now().isoformat(), row["id"]),
+        )
+        conn.commit()
+    # Удаляем входной файл чтобы не занимал место
+    inp = INPUT_DIR / row["input_filename"]
+    inp.unlink(missing_ok=True)
+    mode_label = MODES_LABELS.get(row["mode"], row["mode"])
+    await update.message.reply_text(
+        f"⛔ Задание #{row['id']} ({mode_label}) отменено.\n"
+        f"В очереди: {_pending_count()}.",
+        reply_markup=MAIN_KEYBOARD,
+    )
+
+
 async def cmd_request_specs(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     """Пользователь нажал «📝 Характеристики» — показываем выбор режима."""
     if not update.effective_user or not _allowed(update.effective_user.id):
@@ -685,6 +714,8 @@ async def on_keyboard_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
     # Действия
     if text == BTN_STATUS:
         await cmd_status(update, ctx)
+    elif text == BTN_CANCEL_LAST:
+        await cmd_cancel_last(update, ctx)
     elif text == BTN_CLEAR:
         await cmd_clear_queue(update, ctx)
     elif text == BTN_RESTART:
@@ -719,9 +750,9 @@ async def handle_photo(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    # Лимит очереди — не более 10 pending задач
+    # Лимит очереди — не более 20 pending задач
     user_pending = _pending_count()
-    if user_pending >= 10:
+    if user_pending >= 20:
         await msg.reply_text(
             f"⚠️ В очереди уже {user_pending} задач. Дождись обработки или нажми «❌ Очистить очередь».",
             reply_markup=MAIN_KEYBOARD,
@@ -1070,6 +1101,7 @@ async def post_init(app: Application) -> None:
         BotCommand("status",        "Очередь, режим, характеристики"),
         BotCommand("agent_status",  "Онлайн ли локальный агент"),
         BotCommand("last",          "Последние 5 результатов + перегенерация"),
+        BotCommand("cancel_last",   "Отменить последнее ожидающее задание"),
         BotCommand("specs",         "Ввести характеристики товара"),
         BotCommand("clear",         "Снять все ожидающие задачи"),
         BotCommand("restart_stuck", "Пере-запустить зависшие (>5 мин)"),
@@ -1117,6 +1149,7 @@ def main() -> None:
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("agent_status", cmd_agent_status))
     app.add_handler(CommandHandler("last", cmd_last))
+    app.add_handler(CommandHandler("cancel_last", cmd_cancel_last))
     app.add_handler(CommandHandler("clear", cmd_clear_queue))
     app.add_handler(CommandHandler("restart_stuck", cmd_restart_stuck))
     app.add_handler(CommandHandler("specs", cmd_request_specs))
@@ -1132,7 +1165,7 @@ def main() -> None:
 
     # Reply-клавиатура шлёт обычный текст — ловим точные совпадения с подписями кнопок
     import re
-    button_labels = list(MODES_LABELS.values()) + [BTN_SPECS, BTN_STATUS, BTN_CLEAR, BTN_RESTART, BTN_HIDE]
+    button_labels = list(MODES_LABELS.values()) + [BTN_SPECS, BTN_STATUS, BTN_CANCEL_LAST, BTN_CLEAR, BTN_RESTART, BTN_HIDE]
     pattern = "^(" + "|".join(re.escape(b) for b in button_labels) + ")$"
     app.add_handler(MessageHandler(
         filters.TEXT & filters.Regex(pattern),
