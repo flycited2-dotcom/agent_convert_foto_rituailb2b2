@@ -365,17 +365,22 @@ def parse_brand_model(specs: str | None) -> tuple[str | None, str | None, str]:
         return brand, model, specs.strip()
 
     # Pass 4: fallback — первое слово первой осмысленной строки → brand, остальное → model
+    # Пропускаем строки-метки вида «Ключ: значение» (Размеры:, Параметры: и т.д.)
     for raw in specs.splitlines():
         clean = _first_text(raw)
         if not clean:
             continue
         words = clean.split()
-        if words:
-            if brand is None:
-                brand = words[0]
-            if model is None and len(words) >= 2:
-                model = " ".join(words[1:])
-            break
+        if not words:
+            continue
+        # Если первое слово — метка «Слово:», это не бренд — пропускаем строку
+        if words[0].endswith(":") and len(words[0]) > 1:
+            continue
+        if brand is None:
+            brand = words[0]
+        if model is None and len(words) >= 2:
+            model = " ".join(words[1:])
+        break
 
     return (brand or None, model or None, specs.strip())
 
@@ -732,9 +737,12 @@ async def on_specs_reply(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     set_user_specs(msg.chat_id, text, mode)
+    set_user_mode(msg.chat_id, mode)  # переключаем режим на тот, для которого введены specs
+    label = MODES_LABELS.get(mode, mode)
     await msg.reply_text(
-        f"✅ Характеристики для «{MODES_LABELS.get(mode, mode)}» сохранены ({len(text)} симв.).\n"
-        "Будут автоматически подставлены при следующем фото в этом режиме.\n\n"
+        f"✅ Характеристики сохранены ({len(text)} симв.).\n"
+        f"Режим переключён: {label}\n"
+        "Следующее фото будет обработано в этом режиме с этими характеристиками.\n\n"
         "Чтобы задать другой режим — нажми «📝 Характеристики» снова.\n"
         "Чтобы сбросить — ответь словом «сброс».",
         reply_markup=MAIN_KEYBOARD,

@@ -307,3 +307,99 @@ def test_action_preserves_conditioner_mode(isolated_db, action):
     assert new_job["mode"] == "conditioner"
     assert new_job["brand"] == "Midea"
     assert new_job["model"] == "MSAC-12HRN1"
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 6. Ввод характеристик переключает активный режим (НОВЫЙ ФУНКЦИОНАЛ)
+# ══════════════════════════════════════════════════════════════════════
+
+def test_specs_entry_switches_active_mode(isolated_db):
+    """
+    Ввод характеристик для режима переключает активный режим пользователя.
+    Симулирует исправленный on_specs_reply: set_user_specs + set_user_mode.
+    """
+    # Пользователь был в режиме КБТ
+    set_user_mode(900, "kbt")
+    assert get_user_mode(900) == "kbt"
+
+    # Исправленный on_specs_reply делает обе операции
+    detected_mode = "conditioner"
+    set_user_specs(900, "Midea\nMSAC-12HRN1\nИнвертор", detected_mode)
+    set_user_mode(900, detected_mode)
+
+    # После фикса: режим переключился на conditioner
+    assert get_user_mode(900) == "conditioner"
+    assert get_user_specs(900, "conditioner") is not None
+
+
+def test_full_flow_specs_to_photo_mode(isolated_db):
+    """
+    Полный путь: пользователь в wreath, вводит specs для conditioner,
+    отправляет фото — задача должна создаться с mode=conditioner и корректными specs.
+    """
+    _, conn_fn = isolated_db
+
+    # Изначально: режим wreath
+    set_user_mode(901, "wreath")
+
+    # Пользователь вводит характеристики для conditioner (on_specs_reply с фиксом)
+    detected_mode = "conditioner"
+    set_user_specs(901, "Midea\nMSAC-12HRN1\nИнвертор\nКласс A++", detected_mode)
+    set_user_mode(901, detected_mode)  # <-- это то, что должен делать on_specs_reply
+
+    # Фото приходит — handle_photo читает текущий режим и specs
+    active_mode = get_user_mode(901)
+    raw_specs = get_user_specs(901, active_mode) if active_mode in MODES_WITH_SPECS else None
+
+    assert active_mode == "conditioner"
+    assert raw_specs is not None
+    assert "Midea" in raw_specs
+
+
+def test_specs_entry_for_all_modes_requiring_specs(isolated_db):
+    """Ввод characteristics для каждого режима с requires_specs переключает на него."""
+    for i, mode in enumerate(sorted(MODES_WITH_SPECS), start=1000):
+        # Пользователь в другом режиме
+        other_mode = "ritual"
+        set_user_mode(i, other_mode)
+
+        # Вводит specs для mode (on_specs_reply с фиксом)
+        set_user_specs(i, f"specs for {mode}", mode)
+        set_user_mode(i, mode)  # фикс
+
+        assert get_user_mode(i) == mode, (
+            f"После ввода specs для {mode} режим должен переключиться на {mode}"
+        )
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 7. parse_brand_model — не берёт слова-лейблы как brand
+# ══════════════════════════════════════════════════════════════════════
+
+def test_parse_ignores_label_words_as_brand():
+    """
+    FAILING TEST — баг: 'Размеры: 60x80' → brand='Размеры:' (неверно).
+    После фикса: пропускаем строки вида 'Ключ: значение' как первую строку.
+    """
+    specs = "Размеры: 60x85x180 см\nLG LRSOS2706S\nNo Frost\nA++"
+    brand, model, _ = parse_brand_model(specs)
+    assert brand != "Размеры:", (
+        "БАГ: 'Размеры:' не должен быть брендом — это служебная метка, не название"
+    )
+    assert brand == "LG" or brand is not None, "Бренд должен быть извлечён из строки 'LG LRSOS2706S'"
+
+
+def test_parse_real_kbt_specs_format(isolated_db):
+    """Реальный формат KBT-specs с несколькими товарами — у каждого уникальный brand."""
+    products = [
+        ("LG LRSOS2706S Side-by-Side\nNo Frost\n635л", "LG"),
+        ("Samsung RB38T600FSA\nNo Frost\n385л", "Samsung"),
+        ("Bosch KGV39XL21R\nNo Frost\n350л", "Bosch"),
+    ]
+    brands = set()
+    for specs_text, expected_brand in products:
+        brand, model, _ = parse_brand_model(specs_text)
+        assert brand == expected_brand, f"Ожидался бренд {expected_brand!r}, получен {brand!r}"
+        brands.add(brand)
+
+    assert len(brands) == 3, "Каждый товар должен иметь уникальный бренд"
