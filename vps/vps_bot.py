@@ -915,8 +915,10 @@ async def on_callback(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         shutil.copyfile(src, INPUT_DIR / new_filename)
         with db_conn() as conn:
             conn.execute(
-                "INSERT INTO jobs (chat_id, input_filename) VALUES (?, ?)",
-                (q.message.chat_id, new_filename),
+                "INSERT INTO jobs (chat_id, input_filename, mode, specs, brand, model) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (q.message.chat_id, new_filename,
+                 row["mode"], row["specs"], row["brand"], row["model"]),
             )
             conn.commit()
         await q.message.reply_text(
@@ -941,8 +943,10 @@ async def on_callback(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         shutil.copyfile(src, INPUT_DIR / new_filename)
         with db_conn() as conn:
             conn.execute(
-                "INSERT INTO jobs (chat_id, input_filename) VALUES (?, ?)",
-                (q.message.chat_id, new_filename),
+                "INSERT INTO jobs (chat_id, input_filename, mode, specs, brand, model) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (q.message.chat_id, new_filename,
+                 row["mode"], row["specs"], row["brand"], row["model"]),
             )
             conn.commit()
         await q.message.reply_text(
