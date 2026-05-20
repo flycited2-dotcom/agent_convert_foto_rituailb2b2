@@ -14,7 +14,7 @@ from pathlib import Path
 
 from playwright.async_api import Browser, Page, async_playwright
 
-from clipboard_utils import copy_image_to_clipboard, copy_text_to_clipboard
+from clipboard_utils import copy_image_to_clipboard
 from config import (
     CHROME_CDP_URL,
     DEFAULT_MODE,
@@ -120,10 +120,15 @@ async def paste_image(page: Page, image_path: Path, settle_seconds: float = 4.0)
 
 
 async def paste_text(page: Page, text: str) -> None:
-    copy_text_to_clipboard(text)
+    # НЕ используем clipboard + Ctrl+V: ChatGPT превращает длинную вставку из
+    # буфера обмена в файл-вложение «Вставленный текст.txt», который модель не
+    # читает как инструкцию (в результате игнорирует {{SPECS}} и копирует
+    # характеристики с эталонных картинок). insertText дописывает текст как
+    # ввод с клавиатуры (input-событие insertText), поэтому он остаётся
+    # обычным инлайн-текстом сообщения и читается моделью.
     await page.locator(COMPOSER_SELECTOR).first.click()
     await asyncio.sleep(0.3)
-    await page.keyboard.press("Control+V")
+    await page.keyboard.insert_text(text)
     await asyncio.sleep(0.5)
 
 
