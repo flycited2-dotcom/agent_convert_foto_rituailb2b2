@@ -123,6 +123,46 @@ c.exec_command('systemctl restart ritualb2b-bot ritualb2b-api')
    `requires_specs=True` + `default_specs` (агент)
 7. Залить vps_bot.py на VPS, перезапустить bot/api
 
+## Критические факты (грабли, на которые уже наступали)
+
+### ⚠️ Вставка промпта — ТОЛЬКО `insert_text`, НЕ clipboard
+`agent.py::paste_text` ОБЯЗАН использовать `page.keyboard.insert_text(text)`,
+а НЕ `copy_text_to_clipboard` + `Ctrl+V`. Причина: ChatGPT превращает длинную
+вставку из буфера обмена в **файл-вложение «Вставленный текст.txt»**, который
+модель НЕ читает как инструкцию — она игнорирует `{{SPECS}}` и копирует
+характеристики/текст с эталонных картинок. Симптом: «характеристики не
+меняются», на карточке появляются плашки с эталона вместо введённых
+пользователем. Фикс — коммит `b6f1839` (2026-05-20).
+(В Playwright Python метод — `insert_text`, snake_case. Не `insertText`.)
+
+### Эталоны не должны «протекать» в контент
+Эталоны кондиционера (`reference/conditioner/etalon_*.png`) — это карточки
+KENTATSU с готовыми плашками характеристик. Модель склонна копировать ИХ текст.
+В `prompts/conditioner.txt` добавлены явные запреты копировать характеристики
+с Фото 1/Фото 2 — брать только из раздела «Список преимуществ» ({{SPECS}}).
+
+### Google Drive (загрузка результатов)
+- Работает из `remote_agent.py` (локально), у каждого режима своя папка.
+- Нужны 2 файла рядом с `gdrive.py` (оба в `.gitignore`):
+  `gdrive_oauth_client.json` (OAuth desktop client) + `gdrive_token.json` (токен).
+- Проект Google Cloud: `foto-ritualb2b-korzinki`, аккаунт `flycited2@gmail.com`.
+- Включатель в `.env`: `GDRIVE_CREDENTIALS_JSON=gdrive_oauth_client.json`
+  (если пусто — загрузка отключена). Папки: `*_GDRIVE_FOLDER_ID` для 5 режимов.
+- Повторная авторизация: открыть auth URL в Chrome через расширение (аккаунт
+  уже залогинен), callback ловит локальный сервер на порту 8788.
+
+### Перезапуск remote_agent.py после правок agent.py/config.py/prompts
+`config.py` читает промпты при импорте — изменения промптов/кода подхватываются
+ТОЛЬКО после рестарта `remote_agent.py`. Запуск (Chrome уже открыт на :9333):
+`nohup python remote_agent.py > logs/agent_nohup.out 2>&1 &` (PowerShell
+Start-Process и `cmd start` в этой среде работали ненадёжно).
+
+### Застрявшие задачи
+Если убить агента в момент генерации — задача остаётся в статусе `processing`
+и не переобрабатывается. Сбросить: `UPDATE jobs SET status='pending' WHERE id=N`
+в `/root/ritualb2b/queue.db` на VPS (через paramiko + heredoc-скрипт; SFTP на
+VPS работает нестабильно — заливать файлы через base64-чанки по SSH).
+
 ## Что НЕ нужно делать
 
 - Никогда не запускать локальный `bot.py` параллельно с VPS-ботом — оба
