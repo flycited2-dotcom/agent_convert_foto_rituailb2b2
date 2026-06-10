@@ -1097,17 +1097,23 @@ async def result_sender(app: Application) -> None:
                     channel_id = MODES_CHANNELS.get(job_mode, "")
 
                     if channel_id:
-                        # Отправляем только в канал режима — без дублирования в личный чат
+                        # Отправляем только в канал режима — без дублирования в личный чат.
+                        # Большие файлы (5-6 МБ) требуют увеличенных таймаутов, иначе
+                        # send_document падает с "Timed out".
                         try:
                             with open(out_path, "rb") as f:
                                 await app.bot.send_document(
                                     chat_id=int(channel_id),
                                     document=InputFile(f, filename=row["output_filename"]),
                                     caption=row["output_filename"],
+                                    read_timeout=120, write_timeout=120, connect_timeout=30,
                                 )
                             log.info("Канал %s: %s", channel_id, row["output_filename"])
                         except Exception as e:
-                            log.warning("Ошибка отправки в канал %s: %s", channel_id, e)
+                            # НЕ помечаем result_sent=1 — повторим на следующей итерации
+                            # (каналы валидны, таймаут обычно временный).
+                            log.warning("Ошибка отправки в канал %s: %s — повтор позже", channel_id, e)
+                            continue
                     else:
                         # Канал не настроен — fallback в личный чат
                         keyboard = InlineKeyboardMarkup([
@@ -1125,6 +1131,7 @@ async def result_sender(app: Application) -> None:
                                 document=InputFile(f, filename=row["output_filename"]),
                                 caption=caption,
                                 reply_markup=keyboard,
+                                read_timeout=120, write_timeout=120, connect_timeout=30,
                             )
                         log.info("Личный чат: %s → %s", row["output_filename"], row["chat_id"])
 
