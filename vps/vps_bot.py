@@ -403,6 +403,9 @@ BTN_STATUS       = "📊 Статус"
 BTN_CLEAR        = "❌ Очистить очередь"
 BTN_CANCEL_LAST  = "⛔ Отменить последнее"
 BTN_RESTART      = "♻️ Рестарт зависших"
+BTN_START_AGENT  = "🚀 Запустить агента"
+BTN_RESTART_AGENT = "🔁 Перезапуск агента"
+BTN_STOP_AGENT   = "⛔ Стоп агента"
 BTN_HIDE         = "🔙 Скрыть меню"
 
 # Reply-клавиатура: режимы / характеристики+статус / действия.
@@ -415,7 +418,8 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
         [KeyboardButton(MODES_LABELS["kbt"])],
         [KeyboardButton(BTN_SPECS), KeyboardButton(BTN_STATUS)],
         [KeyboardButton(BTN_CANCEL_LAST), KeyboardButton(BTN_CLEAR)],
-        [KeyboardButton(BTN_RESTART)],
+        [KeyboardButton(BTN_RESTART), KeyboardButton(BTN_START_AGENT)],
+        [KeyboardButton(BTN_RESTART_AGENT), KeyboardButton(BTN_STOP_AGENT)],
         [KeyboardButton(BTN_HIDE)],
     ],
     resize_keyboard=True,
@@ -466,6 +470,141 @@ async def cmd_agent_status(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None
         f"В очереди: {pending}",
         reply_markup=MAIN_KEYBOARD,
     )
+
+
+def _agent_hb_age() -> float | None:
+    """Возраст последнего heartbeat агента в секундах (None — данных нет)."""
+    with db_conn() as conn:
+        row = conn.execute("SELECT seen_at FROM agent_heartbeat WHERE id=1").fetchone()
+    if not row or not row["seen_at"]:
+        return None
+    return (datetime.now() - datetime.fromisoformat(row["seen_at"])).total_seconds()
+
+
+def _set_agent_flag(command: str) -> None:
+    """Ставит команду для вотчдога на локальном ПК (исполняется один раз)."""
+    with db_conn() as conn:
+        conn.execute("CREATE TABLE IF NOT EXISTS flags (key TEXT PRIMARY KEY, value TEXT)")
+        conn.execute(
+            "INSERT OR REPLACE INTO flags (key, value) VALUES ('agent_command', ?)",
+            (command,),
+        )
+        conn.commit()
+
+
+async def cmd_start_agent(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Кнопка «🚀 Запустить агента»: ставит флаг agent_command='start' —
+    вотчдог на локальном ПК подхватит его и поднимет Chrome + remote_agent.py."""
+    if not update.effective_user or not _allowed(update.effective_user.id):
+        return
+
+    # Агент свежо стучался? Тогда запускать нечего.
+    age = _agent_hb_age()
+    if age is not None and age < 90:
+        await update.message.reply_text(
+            f"🟢 Агент уже на связи (контакт {int(age)} сек. назад) — запуск не нужен.\n"
+            f"Если он завис — используй «{BTN_RESTART_AGENT}».",
+            reply_markup=MAIN_KEYBOARD,
+        )
+        return
+
+    _set_agent_flag("start")
+    await update.message.reply_text(
+        "🚀 Команда отправлена. Вотчдог на ПК подхватит её в течение ~15 сек,\n"
+        "поднимет Chrome (если закрыт) и запустит агента.\n"
+        "Проверю связь через 2 минуты…",
+        reply_markup=MAIN_KEYBOARD,
+    )
+
+    chat_id = update.effective_chat.id
+
+    async def _confirm() -> None:
+        await asyncio.sleep(120)
+        age2 = _agent_hb_age()
+        ok = age2 is not None and age2 < 60
+        try:
+            if ok:
+                await ctx.bot.send_message(chat_id, "✅ Агент запустился и на связи.")
+            else:
+                await ctx.bot.send_message(
+                    chat_id,
+                    "❌ Агент не вышел на связь за 2 мин.\n"
+                    "Проверь, включён ли ПК и работает ли вотчдог (start_watchdog.bat).",
+                )
+        except Exception:
+            pass
+
+    asyncio.create_task(_confirm())
+
+
+async def cmd_restart_agent(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Кнопка «🔁 Перезапуск агента»: вотчдог убьёт remote_agent.py и запустит
+    заново. Использовать если агент завис (висит в очереди, не отвечает)."""
+    if not update.effective_user or not _allowed(update.effective_user.id):
+        return
+
+    _set_agent_flag("restart")
+    await update.message.reply_text(
+        "🔁 Команда на перезапуск отправлена.\n"
+        "Вотчдог убьёт агента и поднимет заново (~20 сек).\n"
+        "⚠️ Если шла генерация — задача вернётся в очередь автоматически.\n"
+        "Проверю связь через 2 минуты…",
+        reply_markup=MAIN_KEYBOARD,
+    )
+
+    chat_id = update.effective_chat.id
+
+    async def _confirm() -> None:
+        await asyncio.sleep(120)
+        age2 = _agent_hb_age()
+        ok = age2 is not None and age2 < 60
+        try:
+            if ok:
+                await ctx.bot.send_message(chat_id, "✅ Агент перезапущен и на связи.")
+            else:
+                await ctx.bot.send_message(
+                    chat_id,
+                    "❌ Агент не вышел на связь после перезапуска.\n"
+                    "Проверь вотчдог (start_watchdog.bat) на ПК.",
+                )
+        except Exception:
+            pass
+
+    asyncio.create_task(_confirm())
+
+
+async def cmd_stop_agent(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Кнопка «⛔ Стоп агента»: вотчдог убьёт remote_agent.py.
+    Фото будут копиться в очереди до следующего запуска."""
+    if not update.effective_user or not _allowed(update.effective_user.id):
+        return
+
+    _set_agent_flag("stop")
+    await update.message.reply_text(
+        "⛔ Команда на остановку отправлена.\n"
+        "Новые фото будут копиться в очереди.\n"
+        f"Запустить снова — кнопкой «{BTN_START_AGENT}».",
+        reply_markup=MAIN_KEYBOARD,
+    )
+
+    chat_id = update.effective_chat.id
+
+    async def _confirm() -> None:
+        await asyncio.sleep(60)
+        age2 = _agent_hb_age()
+        stopped = age2 is None or age2 > 40
+        try:
+            if stopped:
+                await ctx.bot.send_message(chat_id, "✅ Агент остановлен.")
+            else:
+                await ctx.bot.send_message(
+                    chat_id,
+                    "⚠️ Агент всё ещё шлёт heartbeat — возможно, остановка не сработала.",
+                )
+        except Exception:
+            pass
+
+    asyncio.create_task(_confirm())
 
 
 async def cmd_last(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
@@ -789,6 +928,12 @@ async def on_keyboard_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
         await cmd_clear_queue(update, ctx)
     elif text == BTN_RESTART:
         await cmd_restart_stuck(update, ctx)
+    elif text == BTN_START_AGENT:
+        await cmd_start_agent(update, ctx)
+    elif text == BTN_RESTART_AGENT:
+        await cmd_restart_agent(update, ctx)
+    elif text == BTN_STOP_AGENT:
+        await cmd_stop_agent(update, ctx)
     elif text == BTN_SPECS:
         await cmd_request_specs(update, ctx)
     elif text == BTN_HIDE:
@@ -1029,7 +1174,8 @@ async def _auto_housekeeping(app: Application) -> None:
                                 text=(
                                     f"⚠️ Агент не отвечает {int(age // 60)} мин.\n"
                                     f"В очереди: {pending_n} задач.\n"
-                                    "Запусти remote_agent.py на локальном ПК."
+                                    f"Нажми «{BTN_START_AGENT}» в меню — или запусти "
+                                    "remote_agent.py на ПК вручную."
                                 ),
                             )
                         except Exception as ae:
@@ -1245,7 +1391,7 @@ def main() -> None:
 
     # Reply-клавиатура шлёт обычный текст — ловим точные совпадения с подписями кнопок
     import re
-    button_labels = list(MODES_LABELS.values()) + [BTN_SPECS, BTN_STATUS, BTN_CANCEL_LAST, BTN_CLEAR, BTN_RESTART, BTN_HIDE]
+    button_labels = list(MODES_LABELS.values()) + [BTN_SPECS, BTN_STATUS, BTN_CANCEL_LAST, BTN_CLEAR, BTN_RESTART, BTN_START_AGENT, BTN_RESTART_AGENT, BTN_STOP_AGENT, BTN_HIDE]
     pattern = "^(" + "|".join(re.escape(b) for b in button_labels) + ")$"
     app.add_handler(MessageHandler(
         filters.TEXT & filters.Regex(pattern),

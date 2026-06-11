@@ -82,6 +82,11 @@ Telegram-бот для пользователя @flycited (Алексей Цар
 ```
 agent.py              — обработка одного фото через Chrome (process_one_file)
 remote_agent.py       — поллер задач с VPS, SSH-туннель, цикл retry
+ssh_tunnel.py         — класс SSHTunnel (общий для агента и вотчдога)
+agent_watchdog.py     — вотчдог: поллит VPS, по кнопке из Telegram поднимает
+                        Chrome+агента. Автозапуск: задача планировщика
+                        RitualB2B_Watchdog (onlogon). Лог: logs/watchdog.log
+start_watchdog.bat    — ручной запуск вотчдога
 config.py             — MODES + Mode dataclass + get_mode/slugify
 prompts/<key>.txt     — промпты для каждого режима
 reference/<key>/      — эталоны
@@ -156,6 +161,34 @@ KENTATSU с готовыми плашками характеристик. Мод
 ТОЛЬКО после рестарта `remote_agent.py`. Запуск (Chrome уже открыт на :9333):
 `nohup python remote_agent.py > logs/agent_nohup.out 2>&1 &` (PowerShell
 Start-Process и `cmd start` в этой среде работали ненадёжно).
+
+### Управление агентом кнопками из Telegram (добавлено 2026-06-11)
+Кнопки бота «🚀 Запустить агента» / «🔁 Перезапуск агента» / «⛔ Стоп агента»
+→ INSERT в таблицу `flags` (`agent_command='start'|'restart'|'stop'`) в
+queue.db → вотчдог на ПК (agent_watchdog.py, поллит `GET /api/agent-command`
+каждые 15 сек) исполняет: start — поднять Chrome (если CDP мёртв) +
+remote_agent.py (если не запущен); restart — убить агента и поднять заново;
+stop — убить агента. Бот подтверждает результат по heartbeat (start/restart —
+через 2 мин, stop — через 1 мин). Эндпоинт отдаёт команду ровно один раз
+(сразу удаляет флаг). Убийство агента — PowerShell Stop-Process по
+CommandLine match 'remote_agent'. Все три команды протестированы e2e.
+
+### Долгоживущие процессы НЕ запускать из Claude-инструментов
+Процессы, запущенные через Start-Process/Popen из тулов Claude Code,
+умирают вместе с завершением тул-колла (харнес чистит дерево процессов).
+Запускать только через Планировщик: `schtasks /run /tn RitualB2B_Watchdog`
+(вотчдог сам поднимет агента через флаг) — или руками через .bat.
+PowerShell-тул (pwsh 7) в песочнице не видит чужие процессы; использовать
+Bash → `powershell -Command` (но Git Bash мангрит `$_` и `/root/...` —
+для VPS-путей ставить `MSYS_NO_PATHCONV=1`).
+
+### SSH-туннель рвётся во время долгой генерации (фикс 2026-06-11)
+Paramiko-туннель умирал за 3–7 мин генерации ChatGPT; агент вечно долбил
+мёртвый локальный порт («Сеть: — жду 30 сек.» в логе), а готовый результат
+удалялся в `finally`. Фикс в `remote_agent.py`: счётчик `net_errors` (2 подряд
+→ raise → main() пересоздаёт туннель), буфер `PENDING_UPLOADS` (недоставленный
+результат досылается после реконнекта), keepalive 10 сек. Симптом в Telegram:
+бот пишет «Агент не отвечает N мин» при живом процессе агента.
 
 ### Застрявшие задачи
 Если убить агента в момент генерации — задача остаётся в статусе `processing`

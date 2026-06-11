@@ -142,6 +142,21 @@ async def complete_job(
     return {"ok": True, "output": out_filename}
 
 
+@app.get("/api/agent-command")
+def agent_command(x_agent_token: str = Header(...)):
+    """Вотчдог на локальном ПК поллит сюда. Отдаём команду и сразу сбрасываем,
+    чтобы она исполнилась ровно один раз."""
+    _auth(x_agent_token)
+    with db_conn() as conn:
+        conn.execute("CREATE TABLE IF NOT EXISTS flags (key TEXT PRIMARY KEY, value TEXT)")
+        row = conn.execute("SELECT value FROM flags WHERE key='agent_command'").fetchone()
+        cmd = row["value"] if row else None
+        if cmd:
+            conn.execute("DELETE FROM flags WHERE key='agent_command'")
+        conn.commit()
+    return {"command": cmd or "none"}
+
+
 @app.post("/api/heartbeat")
 def agent_heartbeat(x_agent_token: str = Header(...)):
     """Агент вызывает при каждом цикле опроса — фиксируем время последнего контакта."""

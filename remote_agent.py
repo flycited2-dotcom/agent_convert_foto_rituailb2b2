@@ -11,14 +11,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import select
-import socket
 import sys
-import threading
 from pathlib import Path
 
 import httpx
-import paramiko
 from dotenv import load_dotenv
 
 ROOT = Path(__file__).resolve().parent
@@ -41,6 +37,7 @@ log = logging.getLogger("remote_agent")
 
 from config import DELAY_BETWEEN_JOBS_SEC, GDRIVE_CREDENTIALS_JSON, GDRIVE_FOLDER_ID, get_mode  # noqa: E402
 from agent import process_one_file  # noqa: E402
+from ssh_tunnel import SSHTunnel  # noqa: E402
 
 # --- SSH / API config (из .env) ---
 VPS_SSH_HOST  = os.getenv("VPS_SSH_HOST", "186.246.44.204")
@@ -52,112 +49,55 @@ POLL_INTERVAL = int(os.getenv("POLL_INTERVAL_SEC", "10"))
 
 
 # ---------------------------------------------------------------------------
-# Простой SSH-туннель через paramiko (без sshtunnel)
-# ---------------------------------------------------------------------------
-
-def _forward_handler(local_sock: socket.socket, transport: paramiko.Transport,
-                     remote_host: str, remote_port: int) -> None:
-    try:
-        chan = transport.open_channel(
-            "direct-tcpip", (remote_host, remote_port), local_sock.getpeername()
-        )
-    except Exception as e:
-        log.debug("Не удалось открыть канал: %s", e)
-        local_sock.close()
-        return
-
-    try:
-        while True:
-            r, _, _ = select.select([local_sock, chan], [], [], 2)
-            if local_sock in r:
-                data = local_sock.recv(4096)
-                if not data:
-                    break
-                chan.sendall(data)
-            if chan in r:
-                data = chan.recv(4096)
-                if not data:
-                    break
-                local_sock.sendall(data)
-    except Exception:
-        pass
-    finally:
-        local_sock.close()
-        chan.close()
-
-
-class SSHTunnel:
-    """Локальный порт → SSH → remote_host:remote_port."""
-
-    def __init__(self, ssh_host: str, ssh_user: str, ssh_pass: str,
-                 remote_host: str, remote_port: int) -> None:
-        self._client = paramiko.SSHClient()
-        self._client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        self._client.connect(ssh_host, username=ssh_user, password=ssh_pass,
-                              timeout=15, banner_timeout=30)
-        transport = self._client.get_transport()
-        transport.set_keepalive(30)
-
-        self._server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self._server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._server.bind(("127.0.0.1", 0))
-        self._server.listen(10)
-        self.local_port: int = self._server.getsockname()[1]
-
-        self._transport = transport
-        self._remote_host = remote_host
-        self._remote_port = remote_port
-        self._active = True
-
-        t = threading.Thread(target=self._accept_loop, daemon=True)
-        t.start()
-
-    def _accept_loop(self) -> None:
-        while self._active:
-            try:
-                self._server.settimeout(1)
-                try:
-                    sock, _ = self._server.accept()
-                except socket.timeout:
-                    continue
-                threading.Thread(
-                    target=_forward_handler,
-                    args=(sock, self._transport, self._remote_host, self._remote_port),
-                    daemon=True,
-                ).start()
-            except Exception:
-                break
-
-    def close(self) -> None:
-        self._active = False
-        try:
-            self._server.close()
-        except Exception:
-            pass
-        try:
-            self._client.close()
-        except Exception:
-            pass
-
-    def __enter__(self) -> "SSHTunnel":
-        return self
-
-    def __exit__(self, *_) -> None:
-        self.close()
-
-
-# ---------------------------------------------------------------------------
 # Основной цикл агента
 # ---------------------------------------------------------------------------
+
+# Результаты, которые не удалось выгрузить на VPS из-за обрыва туннеля:
+# (job_id, путь к файлу). Досылаются в начале каждого витка цикла —
+# модульный список переживает пересоздание туннеля в main().
+PENDING_UPLOADS: list[tuple[int, Path]] = []
+
+
+async def _upload_result(api_url: str, job_id: int, output_path: Path) -> None:
+    """POST результата на VPS. Передаём ИМЕННО локальное имя файла
+    (с brand/model) — VPS сохранит под ним же."""
+    headers = {"x-agent-token": VPS_API_TOKEN}
+    async with httpx.AsyncClient(timeout=120, trust_env=False) as up:
+        with open(output_path, "rb") as f:
+            r = await up.post(
+                f"{api_url}/api/complete/{job_id}",
+                headers=headers,
+                files={"result": (output_path.name, f, "image/png")},
+            )
+    r.raise_for_status()
+    log.info("Загружено на VPS: %s", r.json())
+
 
 async def agent_loop(api_url: str) -> None:
     headers = {"x-agent-token": VPS_API_TOKEN}
     log.info("Агент запущен. API: %s  Опрос каждые %d сек.", api_url, POLL_INTERVAL)
 
+    net_errors = 0  # подряд идущих сетевых ошибок (2 → пересоздаём туннель)
+
     # trust_env=False отключает системный прокси Windows (иначе 503 через Clash/v2ray)
     async with httpx.AsyncClient(timeout=30, trust_env=False) as client:
         while True:
             try:
+                # --- Досылаем результаты, не доставленные из-за обрыва туннеля ---
+                while PENDING_UPLOADS:
+                    p_job_id, p_path = PENDING_UPLOADS[0]
+                    if not p_path.exists():
+                        PENDING_UPLOADS.pop(0)
+                        continue
+                    try:
+                        await _upload_result(api_url, p_job_id, p_path)
+                        p_path.unlink(missing_ok=True)
+                        PENDING_UPLOADS.pop(0)
+                    except httpx.HTTPStatusError as e:
+                        log.error("Досыл задачи %d отклонён VPS (%s) — пропускаю.", p_job_id, e)
+                        PENDING_UPLOADS.pop(0)
+                    # сетевые ошибки уходят в общий обработчик ниже — файл остаётся в списке
+
                 # Heartbeat — VPS фиксирует время последнего контакта агента
                 try:
                     await client.post(f"{api_url}/api/heartbeat", headers=headers)
@@ -166,6 +106,7 @@ async def agent_loop(api_url: str) -> None:
 
                 # --- Получаем следующую задачу ---
                 r = await client.get(f"{api_url}/api/next-job", headers=headers)
+                net_errors = 0  # связь жива
                 if r.status_code == 204:
                     await asyncio.sleep(POLL_INTERVAL)
                     continue
@@ -242,26 +183,32 @@ async def agent_loop(api_url: str) -> None:
                                 log.warning("Google Drive upload failed: %s", gde)
 
                         # --- Загружаем результат на VPS ---
-                        # Передаём ИМЕННО локальное имя файла (с brand/model)
-                        # — VPS сохранит под ним же.
-                        async with httpx.AsyncClient(timeout=120, trust_env=False) as up:
-                            with open(output_path, "rb") as f:
-                                r = await up.post(
-                                    f"{api_url}/api/complete/{job_id}",
-                                    headers=headers,
-                                    files={"result": (output_path.name, f, "image/png")},
-                                )
-                        r.raise_for_status()
-                        log.info("Загружено на VPS: %s", r.json())
+                        try:
+                            await _upload_result(api_url, job_id, output_path)
+                        except httpx.HTTPError:
+                            # Туннель/сеть упали — результат НЕ теряем:
+                            # дошлём после переподключения туннеля.
+                            PENDING_UPLOADS.append((job_id, output_path))
+                            log.warning(
+                                "Выгрузка задачи %d не удалась — результат сохранён, "
+                                "дошлю после переподключения.", job_id,
+                            )
+                            raise
 
                 finally:
                     tmp_input.unlink(missing_ok=True)
-                    if output_path and output_path.exists():
+                    if (output_path and output_path.exists()
+                            and all(p != output_path for _, p in PENDING_UPLOADS)):
                         output_path.unlink(missing_ok=True)
 
                 await asyncio.sleep(DELAY_BETWEEN_JOBS_SEC)
 
             except httpx.HTTPError as e:
+                net_errors += 1
+                if net_errors >= 2:
+                    log.error("Сеть: %s — %d ошибки подряд, пересоздаю SSH-туннель.",
+                              e, net_errors)
+                    raise  # main() закроет туннель и откроет новый
                 log.error("Сеть: %s — жду 30 сек.", e)
                 await asyncio.sleep(30)
             except Exception as e:
