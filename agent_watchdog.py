@@ -47,24 +47,44 @@ CHROME_CDP_URL = os.getenv("CHROME_CDP_URL", "http://127.0.0.1:9333").rstrip("/"
 POLL_SEC       = int(os.getenv("WATCHDOG_POLL_SEC", "15"))
 
 
-def agent_running() -> bool:
-    """Есть ли python-процесс с remote_agent.py в командной строке."""
+# Фильтр процессов ТОЛЬКО по python/pythonw — иначе match по cmdline ловит
+# сам powershell-процесс (его команда содержит искомую строку) → ложные
+# срабатывания и риск убить не тот процесс.
+_PY_PROCS = "$_.Name -in 'python.exe','pythonw.exe'"
+
+
+def _count_procs(cmdline_substr: str, exclude_pid: int | None = None) -> int:
+    cond = f"{_PY_PROCS} -and $_.CommandLine -match '{cmdline_substr}'"
+    if exclude_pid is not None:
+        cond += f" -and $_.ProcessId -ne {exclude_pid}"
     r = subprocess.run(
         ["powershell", "-NoProfile", "-Command",
-         "(Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" "
-         "| Where-Object {$_.CommandLine -match 'remote_agent'} "
-         "| Measure-Object).Count"],
+         f"(Get-CimInstance Win32_Process | Where-Object {{{cond}}} | Measure-Object).Count"],
         capture_output=True, text=True, timeout=30,
     )
-    return r.returncode == 0 and r.stdout.strip() not in ("", "0")
+    if r.returncode != 0 or not r.stdout.strip().isdigit():
+        return 0
+    return int(r.stdout.strip())
+
+
+def another_watchdog_running() -> bool:
+    """True если другой экземпляр вотчдога уже работает (кроме текущего PID).
+    Защита от дублей: задача планировщика перезапускается каждые 5 мин,
+    и если живой вотчдог уже есть — новый сразу выходит."""
+    return _count_procs("agent_watchdog", exclude_pid=os.getpid()) > 0
+
+
+def agent_running() -> bool:
+    """Есть ли python-процесс с remote_agent.py в командной строке."""
+    return _count_procs("remote_agent") > 0
 
 
 def kill_agent() -> bool:
     """Остановить remote_agent.py. True если процесс был найден и убит."""
     r = subprocess.run(
         ["powershell", "-NoProfile", "-Command",
-         "Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" "
-         "| Where-Object {$_.CommandLine -match 'remote_agent'} "
+         f"Get-CimInstance Win32_Process | Where-Object {{{_PY_PROCS} "
+         "-and $_.CommandLine -match 'remote_agent'} "
          "| ForEach-Object { Stop-Process -Id $_.ProcessId -Force; $_.ProcessId }"],
         capture_output=True, text=True, timeout=30,
     )
@@ -113,6 +133,12 @@ def main() -> None:
     if not (VPS_SSH_HOST and (VPS_SSH_KEY or VPS_SSH_PASS) and VPS_API_TOKEN):
         log.error("VPS_SSH_HOST/(VPS_SSH_KEY|VPS_SSH_PASS)/VPS_API_TOKEN не заданы в .env — выход.")
         sys.exit(1)
+
+    # Защита от дублей: планировщик перезапускает задачу каждые 5 мин;
+    # если вотчдог уже жив — этот экземпляр сразу выходит.
+    if another_watchdog_running():
+        log.info("Вотчдог уже запущен в другом процессе — выхожу.")
+        sys.exit(0)
 
     headers = {"x-agent-token": VPS_API_TOKEN}
     while True:

@@ -90,10 +90,13 @@ Telegram-бот для пользователя @flycited (Алексей Цар
 agent.py              — обработка одного фото через Chrome (process_one_file)
 remote_agent.py       — поллер задач с VPS, SSH-туннель, цикл retry
 ssh_tunnel.py         — класс SSHTunnel (общий для агента и вотчдога)
-agent_watchdog.py     — вотчдог: поллит VPS, по кнопке из Telegram поднимает
-                        Chrome+агента. Автозапуск: задача планировщика
-                        RitualB2B_Watchdog (onlogon). Лог: logs/watchdog.log
-start_watchdog.bat    — ручной запуск вотчдога
+agent_watchdog.py     — вотчдог: поллит VPS, по кнопке из Telegram поднимает/
+                        перезапускает/останавливает агента + Chrome. Фоновый
+                        (pythonw, без окна). Автозапуск+самовосстановление:
+                        задача планировщика RitualB2B_Watchdog (time-триггер
+                        каждые 5 мин + logon, MultipleInstances=Parallel +
+                        guard в коде от дублей). Лог: logs/watchdog.log
+start_watchdog.bat    — ручной запуск вотчдога (с окном; для отладки)
 config.py             — MODES + Mode dataclass + get_mode/slugify
 prompts/<key>.txt     — промпты для каждого режима
 reference/<key>/      — эталоны
@@ -199,6 +202,34 @@ stop — убить агента. Бот подтверждает результ
 через 2 мин, stop — через 1 мин). Эндпоинт отдаёт команду ровно один раз
 (сразу удаляет флаг). Убийство агента — PowerShell Stop-Process по
 CommandLine match 'remote_agent'. Все три команды протестированы e2e.
+
+⚠️ ГРАБЛИ: фильтр процессов по CommandLine match ловит САМ powershell-процесс
+(его команда содержит искомую строку) → ложные срабатывания, риск убить не тот
+процесс. ОБЯЗАТЕЛЬНО фильтровать по имени: `$_.Name -in 'python.exe',
+'pythonw.exe'` (вотчдог под pythonw, агент тоже — он наследует sys.executable).
+Хелпер `_count_procs()` в agent_watchdog.py.
+
+### Надёжность вотчдога: автозапуск + самовосстановление (2026-06-11)
+Вотчдог — единственный процесс, который ОБЯЗАН всегда работать на ПК (телега
+не может достучаться до ПК иначе — связь только исходящая ПК→VPS). Сделан
+неубиваемым: задача планировщика `RitualB2B_Watchdog` = ДВА триггера:
+(1) time-триггер `Once -At <дата> -RepetitionInterval 5min -RepetitionDuration
+P3650D` — тикает каждые 5 мин независимо от логона; (2) AtLogOn — мгновенный
+старт при входе. ExecutionTimeLimit PT0S (без лимита, иначе Windows убьёт
+через 72ч). Запуск `pythonw.exe` (фон, без окна). Дубли исключены:
+MultipleInstances=Parallel + `another_watchdog_running()` guard в main()
+(планировщик запускает каждые 5 мин, лишний экземпляр сам выходит по guard).
+Пересоздание задачи — PowerShell `Register-ScheduledTask` (не schtasks CLI).
+E2E-протестировано: убит → воскрешён планировщиком за ~2 сек на ближайшем тике,
+ровно 1 живой экземпляр.
+
+⚠️ ГЛАВНАЯ ГРАБЛЯ (инцидент 2026-06-11): первый вариант
+`onlogon + $trigger.Repetition = <от Once-триггера>` НЕ работает — `NextRunTime`
+получается ПУСТОЙ, будущих запусков нет, убитый вотчдог НЕ воскресает (висел
+мёртвым 4 часа). ВСЕГДА проверять после создания задачи:
+`(Get-ScheduledTaskInfo -TaskName ...).NextRunTime` — должен быть НЕ пустой.
+Надёжный повтор даёт ТОЛЬКО самостоятельный time-триггер (`-Once` с
+`-RepetitionInterval`), не repetition пришитый к logon-триггеру.
 
 ### Долгоживущие процессы НЕ запускать из Claude-инструментов
 Процессы, запущенные через Start-Process/Popen из тулов Claude Code,
