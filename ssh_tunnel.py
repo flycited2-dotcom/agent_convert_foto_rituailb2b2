@@ -9,6 +9,7 @@ import logging
 import select
 import socket
 import threading
+from pathlib import Path
 
 import paramiko
 
@@ -50,11 +51,21 @@ class SSHTunnel:
     """Локальный порт → SSH → remote_host:remote_port."""
 
     def __init__(self, ssh_host: str, ssh_user: str, ssh_pass: str,
-                 remote_host: str, remote_port: int) -> None:
+                 remote_host: str, remote_port: int,
+                 ssh_key: str | None = None) -> None:
         self._client = paramiko.SSHClient()
         self._client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        self._client.connect(ssh_host, username=ssh_user, password=ssh_pass,
-                              timeout=15, banner_timeout=30)
+        # Приоритет — SSH-ключ (если задан и файл существует), иначе пароль.
+        if ssh_key and Path(ssh_key).expanduser().exists():
+            self._client.connect(
+                ssh_host, username=ssh_user,
+                key_filename=str(Path(ssh_key).expanduser()),
+                look_for_keys=False, allow_agent=False,
+                timeout=15, banner_timeout=30,
+            )
+        else:
+            self._client.connect(ssh_host, username=ssh_user, password=ssh_pass,
+                                  timeout=15, banner_timeout=30)
         transport = self._client.get_transport()
         transport.set_keepalive(10)
 

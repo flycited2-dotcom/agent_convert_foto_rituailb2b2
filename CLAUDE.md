@@ -39,10 +39,17 @@ Telegram-бот для пользователя @flycited (Алексей Цар
 
 - **IP:** `213.109.202.45`
 - **Пользователь:** `root`
-- **Пароль:** в локальном `.env` (`VPS_SSH_PASS`, без `@` на конце)
+- **Доступ: ТОЛЬКО по SSH-ключу** (вход по паролю отключён 2026-06-11,
+  `sshd_config.d/00-ritualb2b-hardening.conf`: `PasswordAuthentication no`,
+  `PermitRootLogin prohibit-password`). Ключи на локальном ПК в `~/.ssh/`:
+  - `id_ritualb2b_admin` — полный доступ для деплоя (paramiko `key_filename=`)
+  - `id_ritualb2b_agent` — ОГРАНИЧЕН пробросом порта 8765 (`restrict,
+    permitopen,command="/bin/false"` в authorized_keys), shell не даёт.
+    Путь в `.env` → `VPS_SSH_KEY`. `VPS_SSH_PASS` пустой.
 - **Путь проекта:** `/root/ritualb2b/`
 - **Сервисы:** `ritualb2b-bot.service`, `ritualb2b-api.service` (systemd, autostart)
-- **API порт:** `8765` (только локально внутри VPS; снаружи — через SSH-туннель)
+- **API порт:** `8765` (только локально внутри VPS; снаружи закрыт firewall
+  `INPUT DROP`; для агента — через SSH-туннель)
 
 Старый VPS `186.246.44.204` мигрирован 2026-05-15, сервисы там остановлены.
 После проверки нового — можно сносить (`/root/ritualb2b/` + systemd unit-файлы
@@ -106,10 +113,13 @@ stop_local_bots.bat   — убить локальные python-процессы 
 # Через paramiko из локального Python:
 import paramiko
 c = paramiko.SSHClient(); c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-c.connect('213.109.202.45', username='root', password='<.env VPS_SSH_PASS>', timeout=30)
-sftp = c.open_sftp()
-sftp.put('vps/vps_bot.py', '/root/ritualb2b/vps_bot.py')
-sftp.put('vps/vps_api.py', '/root/ritualb2b/vps_api.py')
+# Деплой — АДМИНСКИМ ключом (пароль на VPS отключён). look_for_keys/allow_agent=False
+# чтобы paramiko не перебирал чужие ключи и не упёрся в MaxAuthTries.
+c.connect('213.109.202.45', username='root',
+          key_filename=r'C:\Users\TLT-1\.ssh\id_ritualb2b_admin',
+          look_for_keys=False, allow_agent=False, timeout=30)
+# SFTP на VPS нестабилен ("EOF during negotiation") — заливать base64-чанками
+# по SSH (см. memory deploy-via-paramiko-not-sftp), затем py_compile + restart.
 c.exec_command('systemctl restart ritualb2b-bot ritualb2b-api')
 ```
 
@@ -161,6 +171,23 @@ KENTATSU с готовыми плашками характеристик. Мод
 ТОЛЬКО после рестарта `remote_agent.py`. Запуск (Chrome уже открыт на :9333):
 `nohup python remote_agent.py > logs/agent_nohup.out 2>&1 &` (PowerShell
 Start-Process и `cmd start` в этой среде работали ненадёжно).
+
+### Безопасность доступа к VPS (hardening 2026-06-11)
+Вход по паролю отключён, только SSH-ключи. Два ключа в `~/.ssh/` на ПК
+(см. раздел «Продакшен VPS»). authorized_keys на VPS:
+```
+<admin_pub>                                              # полный доступ
+restrict,port-forwarding,permitopen="127.0.0.1:8765",command="/bin/false" <agent_pub>
+```
+ВАЖНО: `restrict` НЕ блокирует exec-канал сам по себе — нужен
+`command="/bin/false"`, иначе агентский ключ даёт shell. direct-tcpip
+(проброс порта) при этом продолжает работать — forced command применяется
+только к session/exec-каналам. Конфиг в `sshd_config.d/00-*.conf` (читается
+ПЕРВЫМ, перебивает cloud-init `50-*` с `PasswordAuthentication yes`).
+Перед `systemctl restart ssh` всегда `sshd -t`. Откат при потере ключа —
+через Hestia panel (порт 8083) или консоль провайдера.
+Остаточный риск: пароль root всё ещё валиден для Hestia/консоли (по SSH
+не пускает) — при желании сменить отдельно.
 
 ### Управление агентом кнопками из Telegram (добавлено 2026-06-11)
 Кнопки бота «🚀 Запустить агента» / «🔁 Перезапуск агента» / «⛔ Стоп агента»

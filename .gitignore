@@ -35,5 +35,13 @@ foto-ritualb2b-*.json
 # Артефакты SSH-агентов (временные скрипты)
 ssh_run*.py
 ssh_output*.txt
+_ssh_run.py
+_vps.py
 skills-lock.json
 excel-automation*.zip
+
+# SSH-ключи (никогда не коммитить — приватные ключи доступа к VPS)
+id_ritualb2b_*
+*.pem
+id_ed25519*
+id_rsa*

@@ -43,6 +43,7 @@ from ssh_tunnel import SSHTunnel  # noqa: E402
 VPS_SSH_HOST  = os.getenv("VPS_SSH_HOST", "186.246.44.204")
 VPS_SSH_USER  = os.getenv("VPS_SSH_USER", "root")
 VPS_SSH_PASS  = os.getenv("VPS_SSH_PASS", "")
+VPS_SSH_KEY   = os.getenv("VPS_SSH_KEY", "")
 VPS_API_PORT  = int(os.getenv("VPS_API_PORT", "8765"))
 VPS_API_TOKEN = os.getenv("VPS_API_TOKEN", "")
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL_SEC", "10"))
@@ -226,7 +227,7 @@ def main() -> None:
         try:
             log.info("Открываю SSH-туннель → %s:%d…", VPS_SSH_HOST, VPS_API_PORT)
             with SSHTunnel(VPS_SSH_HOST, VPS_SSH_USER, VPS_SSH_PASS,
-                           "127.0.0.1", VPS_API_PORT) as tunnel:
+                           "127.0.0.1", VPS_API_PORT, ssh_key=VPS_SSH_KEY) as tunnel:
                 api_url = f"http://127.0.0.1:{tunnel.local_port}"
                 log.info("Туннель активен: localhost:%d → VPS:%d", tunnel.local_port, VPS_API_PORT)
                 asyncio.run(agent_loop(api_url))

@@ -40,6 +40,7 @@ from ssh_tunnel import SSHTunnel  # noqa: E402
 VPS_SSH_HOST   = os.getenv("VPS_SSH_HOST", "")
 VPS_SSH_USER   = os.getenv("VPS_SSH_USER", "root")
 VPS_SSH_PASS   = os.getenv("VPS_SSH_PASS", "")
+VPS_SSH_KEY    = os.getenv("VPS_SSH_KEY", "")
 VPS_API_PORT   = int(os.getenv("VPS_API_PORT", "8765"))
 VPS_API_TOKEN  = os.getenv("VPS_API_TOKEN", "")
 CHROME_CDP_URL = os.getenv("CHROME_CDP_URL", "http://127.0.0.1:9333").rstrip("/")
@@ -109,8 +110,8 @@ def handle_start() -> None:
 
 
 def main() -> None:
-    if not (VPS_SSH_HOST and VPS_SSH_PASS and VPS_API_TOKEN):
-        log.error("VPS_SSH_HOST/VPS_SSH_PASS/VPS_API_TOKEN не заданы в .env — выход.")
+    if not (VPS_SSH_HOST and (VPS_SSH_KEY or VPS_SSH_PASS) and VPS_API_TOKEN):
+        log.error("VPS_SSH_HOST/(VPS_SSH_KEY|VPS_SSH_PASS)/VPS_API_TOKEN не заданы в .env — выход.")
         sys.exit(1)
 
     headers = {"x-agent-token": VPS_API_TOKEN}
@@ -118,7 +119,7 @@ def main() -> None:
         try:
             log.info("Открываю SSH-туннель → %s:%d…", VPS_SSH_HOST, VPS_API_PORT)
             with SSHTunnel(VPS_SSH_HOST, VPS_SSH_USER, VPS_SSH_PASS,
-                           "127.0.0.1", VPS_API_PORT) as tunnel:
+                           "127.0.0.1", VPS_API_PORT, ssh_key=VPS_SSH_KEY) as tunnel:
                 api_url = f"http://127.0.0.1:{tunnel.local_port}"
                 log.info("Вотчдог на связи: localhost:%d → VPS:%d, опрос каждые %d сек.",
                          tunnel.local_port, VPS_API_PORT, POLL_SEC)
