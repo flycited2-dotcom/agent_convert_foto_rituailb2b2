@@ -2,8 +2,14 @@
 
 Команды (флаг agent_command в queue.db на VPS, ставится кнопками бота):
   start   — поднять Chrome (если CDP мёртв) + remote_agent.py (если не запущен)
-  restart — убить remote_agent.py и запустить заново (если завис)
-  stop    — убить remote_agent.py
+  restart — убить remote_agent.py И ботовский Chrome, запустить оба заново
+            (лекарство от любых зависаний)
+  stop    — убить remote_agent.py (и не воскрешать до следующего start)
+
+Желаемое состояние (running/stopped) хранится в logs/agent_state.txt:
+start/restart → running, stop → stopped. Раз в минуту вотчдог сверяет
+реальность с желаемым и поднимает умершие Chrome/агента (самовосстановление
+после перезагрузки ПК, краша агента и т.п.).
 
 Запуск: python agent_watchdog.py  (или start_watchdog.bat;
 автозагрузка — задача планировщика RitualB2B_Watchdog)
@@ -96,6 +102,44 @@ def kill_agent() -> bool:
     return False
 
 
+def kill_chrome() -> bool:
+    """Убить ТОЛЬКО ботовский Chrome (по CDP-порту в командной строке).
+    Личный Chrome пользователя порт не содержит — его не трогаем."""
+    port = CHROME_CDP_URL.rsplit(":", 1)[-1]
+    cond = ("$_.Name -eq 'chrome.exe' -and "
+            f"$_.CommandLine -match 'remote-debugging-port={port}'")
+    r = subprocess.run(
+        ["powershell", "-NoProfile", "-Command",
+         f"Get-CimInstance Win32_Process | Where-Object {{{cond}}} "
+         "| ForEach-Object { Stop-Process -Id $_.ProcessId -Force; $_.ProcessId }"],
+        capture_output=True, text=True, timeout=30,
+    )
+    pids = r.stdout.strip()
+    if pids:
+        log.info("Остановил ботовский Chrome (PID: %s)", pids.replace("\n", ", "))
+        return True
+    log.info("Ботовский Chrome не запущен — останавливать нечего.")
+    return False
+
+
+# --- Желаемое состояние агента (переживает перезагрузку ПК) ---
+STATE_FILE = _LOGS_DIR / "agent_state.txt"
+
+
+def set_desired_state(state: str) -> None:
+    try:
+        STATE_FILE.write_text(state, encoding="utf-8")
+    except Exception as e:
+        log.warning("Не записал %s: %s", STATE_FILE.name, e)
+
+
+def desired_state() -> str:
+    try:
+        return STATE_FILE.read_text(encoding="utf-8").strip()
+    except Exception:
+        return "stopped"
+
+
 def chrome_cdp_alive() -> bool:
     try:
         httpx.get(f"{CHROME_CDP_URL}/json/version", timeout=3, trust_env=False)
@@ -105,10 +149,8 @@ def chrome_cdp_alive() -> bool:
 
 
 def handle_start() -> None:
-    if agent_running():
-        log.info("Агент уже работает — повторный запуск не нужен.")
-        return
-
+    # Сначала Chrome: агент может работать при мёртвом CDP — тогда задачи
+    # будут падать, а START "ничего не делал" (грабля 2026-06-12).
     if not chrome_cdp_alive():
         log.info("Chrome CDP не отвечает — запускаю start_chrome.bat…")
         subprocess.Popen(
@@ -121,6 +163,10 @@ def handle_start() -> None:
             time.sleep(1)
         else:
             log.error("Chrome не поднялся за 30 сек — агент всё равно попробую запустить.")
+
+    if agent_running():
+        log.info("Агент уже работает — повторный запуск не нужен.")
+        return
 
     log.info("Запускаю remote_agent.py…")
     subprocess.Popen(
@@ -150,6 +196,7 @@ def main() -> None:
                 log.info("Вотчдог на связи: localhost:%d → VPS:%d, опрос каждые %d сек.",
                          tunnel.local_port, VPS_API_PORT, POLL_SEC)
                 errors = 0
+                enforce_tick = 0
                 with httpx.Client(timeout=15, trust_env=False) as client:
                     while True:
                         try:
@@ -159,15 +206,30 @@ def main() -> None:
                             cmd = r.json().get("command")
                             if cmd == "start":
                                 log.info("Команда START из Telegram.")
+                                set_desired_state("running")
                                 handle_start()
                             elif cmd == "restart":
                                 log.info("Команда RESTART из Telegram.")
+                                set_desired_state("running")
                                 kill_agent()
+                                kill_chrome()
                                 time.sleep(3)
                                 handle_start()
                             elif cmd == "stop":
                                 log.info("Команда STOP из Telegram.")
+                                set_desired_state("stopped")
                                 kill_agent()
+
+                            # Самовосстановление раз в ~минуту: если должны
+                            # работать, а Chrome/агент умерли — поднимаем.
+                            enforce_tick += 1
+                            if enforce_tick >= 4 and not cmd:
+                                enforce_tick = 0
+                                if desired_state() == "running" and (
+                                        not chrome_cdp_alive() or not agent_running()):
+                                    log.warning(
+                                        "Самовосстановление: Chrome или агент умерли — поднимаю.")
+                                    handle_start()
                         except httpx.HTTPError as e:
                             errors += 1
                             log.warning("Сеть: %s (%d подряд)", e, errors)

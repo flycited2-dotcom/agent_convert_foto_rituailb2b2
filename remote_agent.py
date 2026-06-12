@@ -35,7 +35,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("remote_agent")
 
-from config import DELAY_BETWEEN_JOBS_SEC, GDRIVE_CREDENTIALS_JSON, GDRIVE_FOLDER_ID, get_mode  # noqa: E402
+from config import CHROME_CDP_URL, DELAY_BETWEEN_JOBS_SEC, GDRIVE_CREDENTIALS_JSON, GDRIVE_FOLDER_ID, get_mode  # noqa: E402
 from agent import process_one_file  # noqa: E402
 from ssh_tunnel import SSHTunnel  # noqa: E402
 
@@ -105,6 +105,17 @@ async def agent_loop(api_url: str) -> None:
                 except Exception:
                     pass
 
+                # Chrome мёртв — задачу НЕ берём, иначе она сгорит об
+                # ECONNREFUSED за 3 быстрые попытки (грабля 2026-06-12).
+                # Поднять Chrome может вотчдог (кнопка «Запустить» в Telegram).
+                try:
+                    await client.get(f"{CHROME_CDP_URL}/json/version", timeout=3)
+                except Exception:
+                    log.warning("Chrome CDP не отвечает (%s) — задачи не беру, "
+                                "жду 30 сек.", CHROME_CDP_URL)
+                    await asyncio.sleep(30)
+                    continue
+
                 # --- Получаем следующую задачу ---
                 r = await client.get(f"{api_url}/api/next-job", headers=headers)
                 net_errors = 0  # связь жива
@@ -123,6 +134,17 @@ async def agent_loop(api_url: str) -> None:
                     job_id, job_mode, job_brand or "-", job_model or "-",
                     len(job_specs or ""), input_filename,
                 )
+
+                if not input_filename:
+                    # Битая задача (например, после повреждения queue.db) —
+                    # помечаем failed, иначе агент крашится на ней в цикле.
+                    log.error("Задача %d без input_filename — помечаю failed.", job_id)
+                    await client.post(
+                        f"{api_url}/api/fail/{job_id}",
+                        headers=headers,
+                        data={"error": "input_filename отсутствует (битая задача)"},
+                    )
+                    continue
 
                 # --- Скачиваем входной файл ---
                 r = await client.get(f"{api_url}/api/input/{job_id}", headers=headers)

@@ -1141,9 +1141,11 @@ async def _auto_housekeeping(app: Application) -> None:
         await asyncio.sleep(60)
         tick += 1
         try:
-            # Каждые 5 минут: сбрасываем processing-задачи старше 10 мин
+            # Каждые 5 минут: сбрасываем processing-задачи старше 30 мин.
+            # НЕ меньше: легитимная обработка с 3 ретраями занимает до ~15 мин,
+            # сброс раньше времени = повторная обработка той же задачи.
             if tick % 5 == 0:
-                cutoff = (datetime.now() - timedelta(minutes=10)).isoformat()
+                cutoff = (datetime.now() - timedelta(minutes=30)).isoformat()
                 with db_conn() as conn:
                     n = conn.execute(
                         "UPDATE jobs SET status='pending', updated_at=? "
