@@ -1118,14 +1118,15 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if not out_path.exists():
             await q.message.reply_text(f"⚠️ Файл результата не найден: {out_name}", reply_markup=MAIN_KEYBOARD)
             return
-        # Подпись-прайс из Stock Bot (HTML-цитата); если её нет — имя файла.
+        # Подпись-прайс из Stock Bot (HTML-цитата). В канал постим КАК ФОТО с подписью
+        # (не файл-вложение). Без подписи — просто фото.
         stored_caption = row["caption"] if "caption" in row.keys() else None
         try:
             with open(out_path, "rb") as f:
-                await context.bot.send_document(
+                await context.bot.send_photo(
                     chat_id=int(channel_id),
-                    document=InputFile(f, filename=out_name),
-                    caption=stored_caption or out_name,
+                    photo=InputFile(f, filename=out_name),
+                    caption=stored_caption or None,
                     parse_mode=("HTML" if stored_caption else None),
                     read_timeout=120, write_timeout=120, connect_timeout=30,
                 )
