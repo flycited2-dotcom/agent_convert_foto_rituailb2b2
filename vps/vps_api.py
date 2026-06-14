@@ -212,6 +212,7 @@ async def submit_job(
     brand: str = Form(""),
     model: str = Form(""),
     chat_id: int = Form(...),
+    caption: str = Form(""),
     photo: UploadFile = File(...),
 ):
     """Внешний клиент (Stock Bot) ставит задачу в очередь напрямую через API.
@@ -235,9 +236,10 @@ async def submit_job(
 
     with db_conn() as conn:
         conn.execute(
-            "INSERT INTO jobs (chat_id, input_filename, mode, specs, brand, model) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (chat_id, filename, mode, specs or None, brand or None, model or None),
+            "INSERT INTO jobs (chat_id, input_filename, mode, specs, brand, model, caption) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (chat_id, filename, mode, specs or None, brand or None,
+             model or None, caption or None),
         )
         conn.commit()
 

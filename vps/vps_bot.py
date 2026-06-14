@@ -170,6 +170,7 @@ def init_db() -> None:
             "ALTER TABLE jobs ADD COLUMN specs TEXT",
             "ALTER TABLE jobs ADD COLUMN brand TEXT",
             "ALTER TABLE jobs ADD COLUMN model TEXT",
+            "ALTER TABLE jobs ADD COLUMN caption TEXT",
         ):
             try:
                 conn.execute(ddl)
@@ -1117,12 +1118,15 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if not out_path.exists():
             await q.message.reply_text(f"⚠️ Файл результата не найден: {out_name}", reply_markup=MAIN_KEYBOARD)
             return
+        # Подпись-прайс из Stock Bot (HTML-цитата); если её нет — имя файла.
+        stored_caption = row["caption"] if "caption" in row.keys() else None
         try:
             with open(out_path, "rb") as f:
                 await context.bot.send_document(
                     chat_id=int(channel_id),
                     document=InputFile(f, filename=out_name),
-                    caption=out_name,
+                    caption=stored_caption or out_name,
+                    parse_mode=("HTML" if stored_caption else None),
                     read_timeout=120, write_timeout=120, connect_timeout=30,
                 )
             await q.message.reply_text(f"✅ Опубликовано в канал!\n{out_name}", reply_markup=MAIN_KEYBOARD)
@@ -1349,18 +1353,25 @@ async def result_sender(app: Application) -> None:
                     if job_mode == "conditioner":
                         # Режим подтверждения: НЕ постим в канал сразу — карточку
                         # шлём владельцу с кнопками [✅ Опубликовать] [🔄] [🗑].
-                        pending_now = _pending_count()
-                        caption = (
-                            f"✅ Готово ({mode_label}): {row['output_filename']}\n"
-                            f"В очереди: {pending_now}"
-                        )
+                        # Превью = ТА ЖЕ подпись-прайс, что уйдёт в канал (видно до публикации).
+                        stored_caption = row["caption"] if "caption" in row.keys() else None
+                        if stored_caption:
+                            preview, pmode = stored_caption, "HTML"
+                        else:
+                            pending_now = _pending_count()
+                            preview = (
+                                f"✅ Готово ({mode_label}): {row['output_filename']}\n"
+                                f"В очереди: {pending_now}"
+                            )
+                            pmode = None
                         if not channel_id:
-                            caption += "\n⚠️ Канал не настроен — кнопки «Опубликовать» нет."
+                            preview += "\n⚠️ Канал не настроен — кнопки «Опубликовать» нет."
                         with open(out_path, "rb") as f:
                             await app.bot.send_document(
                                 chat_id=row["chat_id"],
                                 document=InputFile(f, filename=row["output_filename"]),
-                                caption=caption,
+                                caption=preview,
+                                parse_mode=pmode,
                                 reply_markup=_conditioner_result_markup(row["id"], bool(channel_id)),
                                 read_timeout=120, write_timeout=120, connect_timeout=30,
                             )

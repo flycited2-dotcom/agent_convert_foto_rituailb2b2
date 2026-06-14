@@ -68,6 +68,22 @@ def test_submit_job_insert_contract(isolated_db):
     assert row["result_sent"] == 0
 
 
+def test_caption_column_stored_and_read(isolated_db):
+    """Миграция добавила jobs.caption; подпись-прайс хранится и читается без потерь."""
+    _, conn_fn = isolated_db
+    cap = "<blockquote>❄️ Daichi\nBravo\n7 — 39 990 ₽</blockquote>"
+    with conn_fn() as conn:
+        conn.execute(
+            "INSERT INTO jobs (chat_id, input_filename, mode, caption) VALUES (?, ?, ?, ?)",
+            (1, "ext_cap.jpg", "conditioner", cap),
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT caption FROM jobs WHERE input_filename='ext_cap.jpg'"
+        ).fetchone()
+    assert row["caption"] == cap
+
+
 # ══════════════════════════════════════════════════════════════════════
 # 2. Кнопки готовой карточки кондиционера (_conditioner_result_markup)
 # ══════════════════════════════════════════════════════════════════════
@@ -123,11 +139,12 @@ def _api_client(tmp_path, monkeypatch):
 def test_submit_job_endpoint(tmp_path, monkeypatch):
     """POST /api/submit-job сохраняет фото и кладёт pending-задачу в БД."""
     client, conn_fn = _api_client(tmp_path, monkeypatch)
+    cap = "<blockquote>❄️ Ballu\nOlympio\n9 — 45 990 ₽</blockquote>"
     resp = client.post(
         "/api/submit-job",
         headers={"x-agent-token": "anything"},
         data={"mode": "conditioner", "specs": "⚡ A++", "brand": "Ballu",
-              "model": "Olympio", "chat_id": "1264067528"},
+              "model": "Olympio", "chat_id": "1264067528", "caption": cap},
         files={"photo": ("p.jpg", b"\xff\xd8\xff", "image/jpeg")},
     )
     assert resp.status_code == 200, resp.text
@@ -141,6 +158,7 @@ def test_submit_job_endpoint(tmp_path, monkeypatch):
     assert row["mode"] == "conditioner"
     assert row["brand"] == "Ballu"
     assert row["chat_id"] == 1264067528
+    assert row["caption"] == cap               # подпись-прайс сохранена endpoint'ом
 
 
 def test_submit_job_rejects_unknown_mode(tmp_path, monkeypatch):
