@@ -1067,7 +1067,7 @@ async def handle_photo(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
 
-async def on_callback(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
     if not q or not update.effective_user or not _allowed(update.effective_user.id):
         if q:
@@ -1096,6 +1096,39 @@ async def on_callback(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         row = conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
     if not row:
         await q.message.reply_text(f"Задача #{job_id} не найдена в БД.", reply_markup=MAIN_KEYBOARD)
+        return
+
+    if action == "publish":
+        # Владелец подтвердил публикацию готовой карточки (режим подтверждения).
+        job_mode = row["mode"] if "mode" in row.keys() else DEFAULT_MODE
+        channel_id = MODES_CHANNELS.get(job_mode, "")
+        if not channel_id:
+            await q.message.reply_text(
+                f"⚠️ Канал для режима «{MODES_LABELS.get(job_mode, job_mode)}» не настроен.\n"
+                "Добавьте в .env VPS переменную <MODE>_TELEGRAM_CHANNEL_ID.",
+                reply_markup=MAIN_KEYBOARD,
+            )
+            return
+        out_name = row["output_filename"]
+        if not out_name:
+            await q.message.reply_text("⚠️ У этой задачи нет output_filename.", reply_markup=MAIN_KEYBOARD)
+            return
+        out_path = OUTPUT_DIR / out_name
+        if not out_path.exists():
+            await q.message.reply_text(f"⚠️ Файл результата не найден: {out_name}", reply_markup=MAIN_KEYBOARD)
+            return
+        try:
+            with open(out_path, "rb") as f:
+                await context.bot.send_document(
+                    chat_id=int(channel_id),
+                    document=InputFile(f, filename=out_name),
+                    caption=out_name,
+                    read_timeout=120, write_timeout=120, connect_timeout=30,
+                )
+            await q.message.reply_text(f"✅ Опубликовано в канал!\n{out_name}", reply_markup=MAIN_KEYBOARD)
+            log.info("publish: канал %s ← %s", channel_id, out_name)
+        except Exception as e:
+            await q.message.reply_text(f"❌ Ошибка публикации: {e}", reply_markup=MAIN_KEYBOARD)
         return
 
     if action == "redo":
@@ -1274,6 +1307,18 @@ async def _auto_housekeeping(app: Application) -> None:
             log.warning("Housekeeping ошибка: %s", e)
 
 
+def _conditioner_result_markup(job_id: int, has_channel: bool) -> InlineKeyboardMarkup:
+    """Кнопки под готовой карточкой кондиционера (режим подтверждения).
+    «Опубликовать» показываем только если канал настроен."""
+    rows = []
+    if has_channel:
+        rows.append([InlineKeyboardButton("✅ Опубликовать в канал",
+                                          callback_data=f"publish:{job_id}")])
+    rows.append([InlineKeyboardButton("🔄 Перегенерировать", callback_data=f"redo:{job_id}")])
+    rows.append([InlineKeyboardButton("🗑 Удалить (плохой)", callback_data=f"bad:{job_id}")])
+    return InlineKeyboardMarkup(rows)
+
+
 async def result_sender(app: Application) -> None:
     log.info("Result sender запущен")
     while True:
@@ -1301,7 +1346,26 @@ async def result_sender(app: Application) -> None:
                     mode_label = MODES_LABELS.get(job_mode, job_mode)
                     channel_id = MODES_CHANNELS.get(job_mode, "")
 
-                    if channel_id:
+                    if job_mode == "conditioner":
+                        # Режим подтверждения: НЕ постим в канал сразу — карточку
+                        # шлём владельцу с кнопками [✅ Опубликовать] [🔄] [🗑].
+                        pending_now = _pending_count()
+                        caption = (
+                            f"✅ Готово ({mode_label}): {row['output_filename']}\n"
+                            f"В очереди: {pending_now}"
+                        )
+                        if not channel_id:
+                            caption += "\n⚠️ Канал не настроен — кнопки «Опубликовать» нет."
+                        with open(out_path, "rb") as f:
+                            await app.bot.send_document(
+                                chat_id=row["chat_id"],
+                                document=InputFile(f, filename=row["output_filename"]),
+                                caption=caption,
+                                reply_markup=_conditioner_result_markup(row["id"], bool(channel_id)),
+                                read_timeout=120, write_timeout=120, connect_timeout=30,
+                            )
+                        log.info("Карточка → владелец (подтверждение): %s", row["output_filename"])
+                    elif channel_id:
                         # Отправляем только в канал режима — без дублирования в личный чат.
                         # Большие файлы (5-6 МБ) требуют увеличенных таймаутов, иначе
                         # send_document падает с "Timed out".

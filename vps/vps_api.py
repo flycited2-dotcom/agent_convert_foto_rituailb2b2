@@ -5,6 +5,8 @@
   GET  /api/input/{job_id}    → скачать входное фото
   POST /api/complete/{job_id} → загрузить результат (multipart: result=<file>)
   POST /api/fail/{job_id}     → пометить как ошибку (form: error=<text>)
+  POST /api/submit-job        → внешний клиент ставит задачу (multipart: photo +
+                                form mode/specs/brand/model/chat_id)
 
 Запуск: uvicorn vps_api:app --host 0.0.0.0 --port 8765
 """
@@ -200,3 +202,43 @@ async def fail_job(
 
     log.info("Job %d failed: %s", job_id, error)
     return {"ok": True}
+
+
+@app.post("/api/submit-job")
+async def submit_job(
+    x_agent_token: str = Header(...),
+    mode: str = Form("conditioner"),
+    specs: str = Form(""),
+    brand: str = Form(""),
+    model: str = Form(""),
+    chat_id: int = Form(...),
+    photo: UploadFile = File(...),
+):
+    """Внешний клиент (Stock Bot) ставит задачу в очередь напрямую через API.
+
+    Принимает фото товара + характеристики, создаёт pending-job в queue.db.
+    Результат уйдёт в чат chat_id через result_sender бота (для conditioner —
+    в режиме подтверждения). Возвращает имя сохранённого входного файла.
+    """
+    _auth(x_agent_token)
+
+    if mode not in ("conditioner", "ritual", "wreath", "mcp", "kbt"):
+        raise HTTPException(status_code=400, detail=f"Неизвестный режим: {mode}")
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+    ext = Path(photo.filename or "input.jpg").suffix.lower() or ".jpg"
+    filename = f"ext_{ts}{ext}"
+    (INPUT_DIR / filename).write_bytes(await photo.read())
+
+    log.info("submit-job: mode=%s brand=%s model=%s chat_id=%s file=%s",
+             mode, brand, model, chat_id, filename)
+
+    with db_conn() as conn:
+        conn.execute(
+            "INSERT INTO jobs (chat_id, input_filename, mode, specs, brand, model) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (chat_id, filename, mode, specs or None, brand or None, model or None),
+        )
+        conn.commit()
+
+    return {"ok": True, "queued": filename}
