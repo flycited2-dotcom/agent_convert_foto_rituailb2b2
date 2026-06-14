@@ -113,9 +113,35 @@ def _specs_mode_keyboard() -> InlineKeyboardMarkup:
 # ---------------------------------------------------------------------------
 
 def db_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
+    # timeout=15 + busy_timeout: при одновременной записи бота и API ждём
+    # освобождения блокировки, а не падаем сразу с "database is locked".
+    conn = sqlite3.connect(DB_PATH, timeout=15)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=15000")
     return conn
+
+
+def try_recover_db() -> bool:
+    """Попытка вылечить БД при 'malformed'/'disk I/O' без потери данных:
+    WAL-checkpoint новым соединением + integrity_check. Возвращает True,
+    если после процедуры база читается корректно.
+
+    Причина проблемы (граблю ловили 12 и 14 июня): протухший WAL/дескриптор
+    после внешней замены файла queue.db. Checkpoint пересобирает WAL в
+    основной файл и обычно снимает 'malformed' без рестарта процесса."""
+    try:
+        c = sqlite3.connect(DB_PATH, timeout=15)
+        try:
+            c.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            res = c.execute("PRAGMA integrity_check").fetchone()
+            ok = bool(res) and res[0] == "ok"
+        finally:
+            c.close()
+        log.warning("try_recover_db: integrity_check=%s", "ok" if ok else "FAIL")
+        return ok
+    except Exception as e:
+        log.error("try_recover_db не удалось: %s", e)
+        return False
 
 
 def init_db() -> None:
@@ -983,13 +1009,33 @@ async def handle_photo(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     raw_specs = get_user_specs(msg.chat_id, mode) if mode in MODES_WITH_SPECS else None
     # Извлекаем бренд+модель из specs (для имени файла), а из самих специй убираем
     brand, model, specs = parse_brand_model(raw_specs)
-    with db_conn() as conn:
-        conn.execute(
-            "INSERT INTO jobs (chat_id, input_filename, mode, specs, brand, model) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (msg.chat_id, filename, mode, specs or None, brand, model),
-        )
-        conn.commit()
+
+    # Запись в очередь с авто-восстановлением при повреждении БД: если первая
+    # попытка падает с 'malformed'/'disk I/O' — чиним через checkpoint и
+    # повторяем. Так фото пользователя НЕ теряется молча (грабля 12/14 июня).
+    def _insert_job() -> None:
+        with db_conn() as conn:
+            conn.execute(
+                "INSERT INTO jobs (chat_id, input_filename, mode, specs, brand, model) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (msg.chat_id, filename, mode, specs or None, brand, model),
+            )
+            conn.commit()
+
+    try:
+        _insert_job()
+    except sqlite3.DatabaseError as e:
+        log.error("Запись задачи упала (%s) — пробую восстановить БД.", e)
+        if try_recover_db():
+            _insert_job()  # вторая попытка после checkpoint
+            log.info("Задача записана после восстановления БД.")
+        else:
+            await msg.reply_text(
+                "⚠️ Временная ошибка базы. Фото не попало в очередь — "
+                "пришли его ещё раз через 10–15 секунд.",
+                reply_markup=MAIN_KEYBOARD,
+            )
+            raise
 
     pending = _pending_count()
     mode_label = MODES_LABELS[mode]
@@ -1201,17 +1247,28 @@ async def _auto_housekeeping(app: Application) -> None:
                 if deleted:
                     log.info("Авто-очистка output: удалено %d файлов", deleted)
 
-            # Раз в сутки: бэкап queue.db
+            # Раз в сутки: бэкап queue.db.
+            # ВАЖНО: НЕ shutil.copy2 — в режиме WAL копирование файла даёт
+            # битый бэкап (часть данных в -wal) и было источником повреждений
+            # (queue.db.corrupt-*). Используем атомарный sqlite backup API:
+            # он делает консистентный снимок даже при активной записи.
             if tick % 1440 == 0:
                 backup_dir = DB_PATH.parent / "backups"
                 backup_dir.mkdir(exist_ok=True)
                 backup_name = f"queue_{datetime.now().strftime('%Y%m%d_%H%M')}.db"
-                shutil.copy2(DB_PATH, backup_dir / backup_name)
+                src = sqlite3.connect(DB_PATH, timeout=30)
+                dst = sqlite3.connect(str(backup_dir / backup_name))
+                try:
+                    with dst:
+                        src.backup(dst)
+                finally:
+                    dst.close()
+                    src.close()
                 # Оставляем только последние 7 бэкапов
                 old_backups = sorted(backup_dir.glob("queue_*.db"))[:-7]
                 for old in old_backups:
                     old.unlink(missing_ok=True)
-                log.info("DB бэкап: %s", backup_name)
+                log.info("DB бэкап (sqlite backup API): %s", backup_name)
 
         except Exception as e:
             log.warning("Housekeeping ошибка: %s", e)
@@ -1319,6 +1376,35 @@ async def result_sender(app: Application) -> None:
             log.exception("result_sender упал: %s", e)
 
 
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Глобальный обработчик ошибок. Раньше его НЕ было ('No error handlers
+    are registered' в логах) — из-за этого sqlite-ошибки роняли обработку
+    молча, и бот «слепнул» (фото не ставились в очередь, кнопки не работали).
+
+    При повреждении БД ('malformed'/'disk I/O') пытаемся вылечить on-the-fly
+    через WAL-checkpoint, чтобы не требовался ручной рестарт сервиса."""
+    err = context.error
+    log.exception("Необработанная ошибка: %s", err)
+
+    msg = str(err).lower()
+    if isinstance(err, sqlite3.DatabaseError) and (
+            "malformed" in msg or "disk i/o" in msg or "not a database" in msg):
+        log.error("БД повреждена — пробую авто-восстановление (checkpoint).")
+        if try_recover_db():
+            log.info("БД восстановлена автоматически.")
+        else:
+            log.error("Авто-восстановление не помогло — нужен рестарт сервиса.")
+            if TELEGRAM_ALLOWED_USER_ID:
+                try:
+                    await context.bot.send_message(
+                        chat_id=TELEGRAM_ALLOWED_USER_ID,
+                        text="⚠️ БД повреждена и не лечится сама. "
+                             "Нужен перезапуск бота на сервере.",
+                    )
+                except Exception:
+                    pass
+
+
 async def post_init(app: Application) -> None:
     init_db()
 
@@ -1400,6 +1486,7 @@ def main() -> None:
         on_keyboard_text,
     ))
     app.add_handler(CallbackQueryHandler(on_callback))
+    app.add_error_handler(on_error)
 
     log.info("VPS-бот запущен.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
