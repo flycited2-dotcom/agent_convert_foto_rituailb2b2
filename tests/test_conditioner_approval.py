@@ -68,6 +68,31 @@ def test_submit_job_insert_contract(isolated_db):
     assert row["result_sent"] == 0
 
 
+def test_redo_retry_preserve_caption(isolated_db):
+    """redo/retry создают новую задачу С ТОЙ ЖЕ подписью (баг: caption терялся)."""
+    _, conn_fn = isolated_db
+    cap = "<blockquote>❄️ Ballu\nOlympio\n9 — 45 990 ₽</blockquote>"
+    with conn_fn() as conn:
+        conn.execute(
+            "INSERT INTO jobs (chat_id, input_filename, mode, specs, brand, model, caption) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (5, "orig.jpg", "conditioner", "s", "Ballu", "Olympio", cap),
+        )
+        conn.commit()
+        orig = conn.execute("SELECT * FROM jobs WHERE input_filename='orig.jpg'").fetchone()
+        # имитируем исправленный INSERT обработчика redo/retry (7 колонок с caption)
+        conn.execute(
+            "INSERT INTO jobs (chat_id, input_filename, mode, specs, brand, model, caption) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (5, "redo_orig.jpg", orig["mode"], orig["specs"],
+             orig["brand"], orig["model"], orig["caption"]),
+        )
+        conn.commit()
+        new = conn.execute("SELECT * FROM jobs WHERE input_filename='redo_orig.jpg'").fetchone()
+    assert new["caption"] == cap
+    assert new["mode"] == "conditioner"
+
+
 def test_caption_column_stored_and_read(isolated_db):
     """Миграция добавила jobs.caption; подпись-прайс хранится и читается без потерь."""
     _, conn_fn = isolated_db
