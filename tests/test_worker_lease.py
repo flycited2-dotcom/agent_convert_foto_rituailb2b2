@@ -74,3 +74,51 @@ def test_lease_endpoint_desktop_then_laptop(tmp_path, monkeypatch):
     res_l = api.worker_lease(x_agent_token="", worker_id="laptop", priority=2)
     assert res_l["active"] is False
     assert res_l["active_worker"] == "desktop"
+
+
+# ─── Клиентский claim_lease (async через asyncio.run, без pytest-asyncio) ───
+
+import asyncio  # noqa: E402
+
+import httpx  # noqa: E402
+
+from worker_lease_client import claim_lease  # noqa: E402
+
+
+def _mock_client(handler):
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://x")
+
+
+def test_claim_lease_returns_active_false():
+    def handler(req):
+        assert req.url.path == "/api/worker/lease"
+        return httpx.Response(200, json={"active": False, "active_worker": "desktop"})
+
+    async def go():
+        async with _mock_client(handler) as c:
+            return await claim_lease(c, "http://x", "tok", "laptop", 2)
+    assert asyncio.run(go()) is False
+
+
+def test_claim_lease_empty_worker_id_is_active_no_http():
+    calls = {"n": 0}
+
+    def handler(req):
+        calls["n"] += 1
+        return httpx.Response(200, json={"active": False})
+
+    async def go():
+        async with _mock_client(handler) as c:
+            return await claim_lease(c, "http://x", "tok", "", 100)
+    assert asyncio.run(go()) is True
+    assert calls["n"] == 0  # пустой worker_id → HTTP не вызывается
+
+
+def test_claim_lease_error_defaults_active():
+    def handler(req):
+        raise httpx.ConnectError("down")
+
+    async def go():
+        async with _mock_client(handler) as c:
+            return await claim_lease(c, "http://x", "tok", "laptop", 2)
+    assert asyncio.run(go()) is True  # блип лиза не стопорит воркер
