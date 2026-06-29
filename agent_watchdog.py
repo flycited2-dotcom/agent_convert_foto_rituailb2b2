@@ -67,6 +67,7 @@ def _count_procs(cmdline_substr: str, exclude_pid: int | None = None) -> int:
         ["powershell", "-NoProfile", "-Command",
          f"(Get-CimInstance Win32_Process | Where-Object {{{cond}}} | Measure-Object).Count"],
         capture_output=True, text=True, timeout=30,
+        creationflags=subprocess.CREATE_NO_WINDOW,  # не мигать окном PowerShell
     )
     if r.returncode != 0 or not r.stdout.strip().isdigit():
         return 0
@@ -93,6 +94,7 @@ def kill_agent() -> bool:
          "-and $_.CommandLine -match 'remote_agent'} "
          "| ForEach-Object { Stop-Process -Id $_.ProcessId -Force; $_.ProcessId }"],
         capture_output=True, text=True, timeout=30,
+        creationflags=subprocess.CREATE_NO_WINDOW,  # не мигать окном PowerShell
     )
     pids = r.stdout.strip()
     if pids:
@@ -113,6 +115,7 @@ def kill_chrome() -> bool:
          f"Get-CimInstance Win32_Process | Where-Object {{{cond}}} "
          "| ForEach-Object { Stop-Process -Id $_.ProcessId -Force; $_.ProcessId }"],
         capture_output=True, text=True, timeout=30,
+        creationflags=subprocess.CREATE_NO_WINDOW,  # не мигать окном PowerShell
     )
     pids = r.stdout.strip()
     if pids:
@@ -171,7 +174,7 @@ def handle_start() -> None:
     log.info("Запускаю remote_agent.py…")
     subprocess.Popen(
         [sys.executable, "remote_agent.py"],
-        cwd=ROOT, creationflags=subprocess.CREATE_NEW_CONSOLE,
+        cwd=ROOT, creationflags=subprocess.CREATE_NO_WINDOW,  # фон, без консольного окна
     )
 
 
