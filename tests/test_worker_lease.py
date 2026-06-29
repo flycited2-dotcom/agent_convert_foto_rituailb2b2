@@ -43,3 +43,34 @@ def test_tiebreak_equal_priority_lexicographic():
 def test_bad_seen_at_ignored():
     rows = [_row("laptop", 2, NOW), {"worker_id": "x", "priority": 1, "seen_at": "broken"}]
     assert active_worker_id(rows, NOW, TTL) == "laptop"
+
+
+# ─── Эндпоинт /api/worker/lease (temp db + monkeypatch db_conn) ───────
+
+import sqlite3  # noqa: E402
+
+import pytest  # noqa: E402
+
+
+def _api_with_db(tmp_path, monkeypatch):
+    pytest.importorskip("fastapi")  # на ноуте fastapi может не стоять; эндпоинт также
+    import vps_api                   # дымово проверяется на VPS (план Task 5, Step 5)
+    db = tmp_path / "q.db"
+
+    def _conn():
+        c = sqlite3.connect(db)
+        c.row_factory = sqlite3.Row
+        return c
+
+    monkeypatch.setattr(vps_api, "db_conn", _conn)
+    monkeypatch.setattr(vps_api, "API_TOKEN", "")  # отключить проверку токена в тесте
+    return vps_api
+
+
+def test_lease_endpoint_desktop_then_laptop(tmp_path, monkeypatch):
+    api = _api_with_db(tmp_path, monkeypatch)
+    res_d = api.worker_lease(x_agent_token="", worker_id="desktop", priority=1)
+    assert res_d["active"] is True
+    res_l = api.worker_lease(x_agent_token="", worker_id="laptop", priority=2)
+    assert res_l["active"] is False
+    assert res_l["active_worker"] == "desktop"

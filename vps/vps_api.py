@@ -23,6 +23,7 @@ from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from config_vps import API_TOKEN, DB_PATH, FAILED_DIR, INPUT_DIR, OUTPUT_DIR, PROCESSED_DIR
+from worker_lease import LEASE_TTL_SECONDS, active_worker_id
 
 log = logging.getLogger("vps_api")
 app = FastAPI(docs_url=None, redoc_url=None)  # отключаем Swagger UI в prod
@@ -157,6 +158,37 @@ def agent_command(x_agent_token: str = Header(...)):
             conn.execute("DELETE FROM flags WHERE key='agent_command'")
         conn.commit()
     return {"command": cmd or "none"}
+
+
+@app.post("/api/worker/lease")
+def worker_lease(
+    x_agent_token: str = Header(...),
+    worker_id: str = Form(...),
+    priority: int = Form(100),
+):
+    """Воркер регистрирует heartbeat и спрашивает, активен ли он сейчас.
+    active=True → можно брать задачи; False → standby (генерит другой)."""
+    _auth(x_agent_token)
+    now = datetime.now()
+    with db_conn() as conn:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS workers ("
+            "worker_id TEXT PRIMARY KEY, priority INTEGER NOT NULL DEFAULT 100, "
+            "seen_at TEXT NOT NULL)"
+        )
+        conn.execute(
+            "INSERT INTO workers (worker_id, priority, seen_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(worker_id) DO UPDATE SET priority=excluded.priority, "
+            "seen_at=excluded.seen_at",
+            (worker_id, priority, now.isoformat()),
+        )
+        conn.commit()
+        rows = [dict(r) for r in conn.execute(
+            "SELECT worker_id, priority, seen_at FROM workers"
+        ).fetchall()]
+    active_id = active_worker_id(rows, now, LEASE_TTL_SECONDS)
+    return {"active": active_id == worker_id, "worker_id": worker_id,
+            "active_worker": active_id}
 
 
 @app.post("/api/heartbeat")
