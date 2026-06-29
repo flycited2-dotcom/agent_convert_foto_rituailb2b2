@@ -38,6 +38,7 @@ log = logging.getLogger("remote_agent")
 from config import CHROME_CDP_URL, DELAY_BETWEEN_JOBS_SEC, GDRIVE_CREDENTIALS_JSON, GDRIVE_FOLDER_ID, get_mode  # noqa: E402
 from agent import process_one_file  # noqa: E402
 from ssh_tunnel import SSHTunnel  # noqa: E402
+from worker_lease_client import claim_lease  # noqa: E402
 
 # --- SSH / API config (из .env) ---
 VPS_SSH_HOST  = os.getenv("VPS_SSH_HOST", "186.246.44.204")
@@ -47,6 +48,8 @@ VPS_SSH_KEY   = os.getenv("VPS_SSH_KEY", "")
 VPS_API_PORT  = int(os.getenv("VPS_API_PORT", "8765"))
 VPS_API_TOKEN = os.getenv("VPS_API_TOKEN", "")
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL_SEC", "10"))
+WORKER_ID       = os.getenv("WORKER_ID", "").strip()
+WORKER_PRIORITY = int(os.getenv("WORKER_PRIORITY", "100"))
 
 
 # ---------------------------------------------------------------------------
@@ -104,6 +107,16 @@ async def agent_loop(api_url: str) -> None:
                     await client.post(f"{api_url}/api/heartbeat", headers=headers)
                 except Exception:
                     pass
+
+                # --- Failover-лиз: если активен другой воркер, в standby ---
+                if WORKER_ID:
+                    active = await claim_lease(client, api_url, VPS_API_TOKEN,
+                                               WORKER_ID, WORKER_PRIORITY)
+                    if not active:
+                        log.info("standby (worker=%s, активен другой) — жду %d сек.",
+                                 WORKER_ID, POLL_INTERVAL)
+                        await asyncio.sleep(POLL_INTERVAL)
+                        continue
 
                 # Chrome мёртв — задачу НЕ берём, иначе она сгорит об
                 # ECONNREFUSED за 3 быстрые попытки (грабля 2026-06-12).
