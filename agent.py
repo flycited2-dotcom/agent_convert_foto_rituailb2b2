@@ -372,11 +372,12 @@ def parse_utp_lines(text: str | None, max_items: int = 7) -> list[str]:
     return out
 
 
-LAST_ASSISTANT_TEXT_JS = """
+# Текст ВСЕХ assistant-сообщений: ChatGPT часто отвечает двумя сообщениями
+# (текст с УТП + отдельное сообщение-изображение) — последнее может быть без текста.
+ASSISTANT_TEXT_JS = """
     () => {
         const sel = '[data-message-author-role="assistant"], [data-author-role="assistant"]';
-        const msgs = [...document.querySelectorAll(sel)];
-        return msgs.length ? msgs[msgs.length - 1].innerText : '';
+        return [...document.querySelectorAll(sel)].map(m => m.innerText).join('\\n');
     }
 """
 
@@ -412,7 +413,7 @@ async def process_research(brand: str | None, model: str | None,
             except Exception as e:
                 log.warning("research: изображение не получено (%s) — вернём только УТП", e)
 
-            text = await page.evaluate(LAST_ASSISTANT_TEXT_JS)
+            text = await page.evaluate(ASSISTANT_TEXT_JS)
             utp = parse_utp_lines(text)
             if not utp:
                 raise RuntimeError("research: в ответе не найден список УТП")
