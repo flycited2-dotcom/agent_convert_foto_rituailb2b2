@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -287,6 +288,7 @@ _MODE_FILE_PREFIX = {
     "conditioner": "konditsioner",
     "mcp":         "mbt",
     "kbt":         "kbt",
+    "research":    "research",
 }
 
 # Кириллица → латиница (простой транслит, ГОСТ-подобный)
@@ -352,6 +354,72 @@ def archive_input(file_path: Path) -> Path:
     target = PROCESSED_DIR / f"{ts}_{file_path.name}"
     file_path.rename(target)
     return target
+
+
+# ── research: по наименованию найти УТП + изображение (для контент-завода) ──
+_UTP_LINE = re.compile(r"^\s*(?:[✓✔•\-–—*]|\d+[.)])\s+(.{3,60})\s*$")
+
+
+def parse_utp_lines(text: str | None, max_items: int = 7) -> list[str]:
+    """Строки-УТП из ответа ChatGPT: маркированные (✓ ✔ - – • * цифры) → «✓ …»."""
+    out = []
+    for line in (text or "").splitlines():
+        m = _UTP_LINE.match(line)
+        if m:
+            out.append(f"✓ {m.group(1).strip()}")
+        if len(out) >= max_items:
+            break
+    return out
+
+
+LAST_ASSISTANT_TEXT_JS = """
+    () => {
+        const sel = '[data-message-author-role="assistant"], [data-author-role="assistant"]';
+        const msgs = [...document.querySelectorAll(sel)];
+        return msgs.length ? msgs[msgs.length - 1].innerText : '';
+    }
+"""
+
+
+async def process_research(brand: str | None, model: str | None,
+                           category: str | None) -> tuple[Path | None, str]:
+    """Research-задача: без входного фото. Открывает research-проект (веб-поиск),
+    спрашивает УТП + изображение товара. Возвращает (путь к картинке | None, текст УТП).
+    Нет списка УТП в ответе = исключение (ретраи делает remote_agent, как у карточек);
+    нет картинки — НЕ ошибка (фолбэк спеки: карточка потом генерится «по названию»)."""
+    cfg = get_mode("research")
+    if cfg.key != "research" or not cfg.is_configured:
+        raise RuntimeError("Режим 'research' не настроен: нет RESEARCH_PROJECT_URL/промпта")
+    product = " ".join(x for x in (category, brand, model) if x).strip()
+    prompt = cfg.render_prompt(product)
+    output_path = make_output_path(mode="research", brand=brand, model=model)
+
+    async with async_playwright() as p:
+        browser = await p.chromium.connect_over_cdp(CHROME_CDP_URL)
+        try:
+            page = await find_or_open_chatgpt(browser)
+            await open_new_chat(page, url=cfg.project_url or "https://chatgpt.com/")
+            await paste_text(page, prompt)
+            await submit(page)
+            await asyncio.sleep(5)
+            baseline_srcs = await snapshot_image_srcs(page)
+
+            photo: Path | None = None
+            try:
+                await wait_for_generation(page, GENERATION_TIMEOUT_SEC * 1000, baseline_srcs)
+                await download_via_anchor(page, output_path, baseline_srcs)
+                photo = output_path
+            except Exception as e:
+                log.warning("research: изображение не получено (%s) — вернём только УТП", e)
+
+            text = await page.evaluate(LAST_ASSISTANT_TEXT_JS)
+            utp = parse_utp_lines(text)
+            if not utp:
+                raise RuntimeError("research: в ответе не найден список УТП")
+            log.info("research: %d УТП, фото=%s", len(utp), photo.name if photo else "нет")
+            return photo, "\n".join(utp)
+        finally:
+            await browser.close()  # для CDP это disconnect, не убивает Chrome
 
 
 async def process_one_file(
