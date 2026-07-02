@@ -49,11 +49,17 @@ def _auth(x_agent_token: str = Header(...)) -> None:
 # ---------------------------------------------------------------------------
 
 @app.get("/api/next-job")
-def next_job(x_agent_token: str = Header(...)):
+def next_job(x_agent_token: str = Header(...), caps: str = ""):
     _auth(x_agent_token)
+    # caps — возможности агента (напр. "research"). Старые агенты параметр не шлют —
+    # research-задачи им НЕ отдаём (не умеют и фейлили бы их «битой задачей»);
+    # обычные карточки отдаём всем, как раньше.
+    where = "status='pending'"
+    if "research" not in (caps or "").split(","):
+        where += " AND mode != 'research'"
     with db_conn() as conn:
         row = conn.execute(
-            "SELECT * FROM jobs WHERE status='pending' ORDER BY id LIMIT 1"
+            f"SELECT * FROM jobs WHERE {where} ORDER BY id LIMIT 1"
         ).fetchone()
         if not row:
             return JSONResponse(status_code=204, content=None)

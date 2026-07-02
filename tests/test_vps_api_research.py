@@ -86,6 +86,20 @@ class ResearchApiTest(unittest.TestCase):
             "SELECT status, output_filename FROM jobs WHERE id=?", (job_id,)).fetchone()
         self.assertEqual(row, ("done", None))   # фото нет → карточка потом «по названию»
 
+    def test_next_job_hides_research_from_legacy_agents(self):
+        """Старый агент (без caps) research не получает — иначе фейлит «битой задачей»."""
+        self._submit()
+        r = self.client.get("/api/next-job", headers={"x-agent-token": "T"})
+        self.assertEqual(r.status_code, 204)      # research скрыт, других задач нет
+
+    def test_next_job_gives_research_to_capable_agents(self):
+        job_id = self._submit()
+        r = self.client.get("/api/next-job", headers={"x-agent-token": "T"},
+                            params={"caps": "research"})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["id"], job_id)
+        self.assertEqual(r.json()["mode"], "research")
+
     def test_bad_token_rejected(self):
         r = self.client.post("/api/submit-research", headers={"x-agent-token": "BAD"},
                              data={"brand": "B", "model": "M", "chat_id": "1"})

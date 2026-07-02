@@ -129,8 +129,9 @@ async def agent_loop(api_url: str) -> None:
                     await asyncio.sleep(30)
                     continue
 
-                # --- Получаем следующую задачу ---
-                r = await client.get(f"{api_url}/api/next-job", headers=headers)
+                # --- Получаем следующую задачу (caps: этот агент умеет research) ---
+                r = await client.get(f"{api_url}/api/next-job", headers=headers,
+                                     params={"caps": "research"})
                 net_errors = 0  # связь жива
                 if r.status_code == 204:
                     await asyncio.sleep(POLL_INTERVAL)
