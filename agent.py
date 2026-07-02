@@ -361,12 +361,17 @@ _UTP_LINE = re.compile(r"^\s*(?:[✓✔•\-–—*]|\d+[.)])\s+(.{3,60})\s*$")
 
 
 def parse_utp_lines(text: str | None, max_items: int = 7) -> list[str]:
-    """Строки-УТП из ответа ChatGPT: маркированные (✓ ✔ - – • * цифры) → «✓ …»."""
+    """Строки-УТП из ответа ChatGPT: маркированные (✓ ✔ - – • * цифры) → «✓ …».
+    Дубли и вложенные маркеры («- ✓ …» после сборки <li>) схлопываются."""
     out = []
     for line in (text or "").splitlines():
         m = _UTP_LINE.match(line)
-        if m:
-            out.append(f"✓ {m.group(1).strip()}")
+        if not m:
+            continue
+        body = re.sub(r"^[✓✔•\-–—*\s]+", "", m.group(1)).strip()
+        item = f"✓ {body}"
+        if body and item not in out:
+            out.append(item)
         if len(out) >= max_items:
             break
     return out
@@ -374,10 +379,17 @@ def parse_utp_lines(text: str | None, max_items: int = 7) -> list[str]:
 
 # Текст ВСЕХ assistant-сообщений: ChatGPT часто отвечает двумя сообщениями
 # (текст с УТП + отдельное сообщение-изображение) — последнее может быть без текста.
+# <li> собираем отдельно с префиксом «- »: маркеры markdown-списков рисуются CSS
+# (::marker) и в innerText НЕ попадают — без префикса парсер УТП их не увидит.
 ASSISTANT_TEXT_JS = """
     () => {
         const sel = '[data-message-author-role="assistant"], [data-author-role="assistant"]';
-        return [...document.querySelectorAll(sel)].map(m => m.innerText).join('\\n');
+        const out = [];
+        for (const m of document.querySelectorAll(sel)) {
+            for (const li of m.querySelectorAll('li')) out.push('- ' + li.innerText);
+            out.push(m.innerText);
+        }
+        return out.join('\\n');
     }
 """
 

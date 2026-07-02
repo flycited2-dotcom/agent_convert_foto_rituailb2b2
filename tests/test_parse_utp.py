@@ -26,6 +26,12 @@ def test_caps_at_max_items():
     assert len(parse_utp_lines(text)) == 7
 
 
+def test_strips_nested_markers_and_dedupes():
+    # после сборки <li> строки приходят как «- ✓ …», а текст сообщения дублирует их
+    text = "- ✓ No Frost\n- ✓ Тихий 39 дБ\n✓ No Frost"
+    assert parse_utp_lines(text) == ["✓ No Frost", "✓ Тихий 39 дБ"]
+
+
 def test_empty_when_no_list():
     assert parse_utp_lines("просто текст без списка") == []
     assert parse_utp_lines("") == []
