@@ -428,7 +428,10 @@ async def process_research(brand: str | None, model: str | None,
             text = await page.evaluate(ASSISTANT_TEXT_JS)
             utp = parse_utp_lines(text)
             if not utp:
-                raise RuntimeError("research: в ответе не найден список УТП")
+                # фрагмент ответа кладём в ошибку (уйдёт в error_text задачи) —
+                # иначе причину «нет УТП» с другой машины не диагностировать
+                frag = " | ".join((text or "").split("\n"))[:350]
+                raise RuntimeError(f"research: в ответе не найден список УТП; ответ: {frag!r}")
             log.info("research: %d УТП, фото=%s", len(utp), photo.name if photo else "нет")
             return photo, "\n".join(utp)
         finally:
