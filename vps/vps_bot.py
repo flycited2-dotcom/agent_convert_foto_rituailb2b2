@@ -171,6 +171,7 @@ def init_db() -> None:
             "ALTER TABLE jobs ADD COLUMN brand TEXT",
             "ALTER TABLE jobs ADD COLUMN model TEXT",
             "ALTER TABLE jobs ADD COLUMN caption TEXT",
+            "ALTER TABLE jobs ADD COLUMN result_specs TEXT",
         ):
             try:
                 conn.execute(ddl)
@@ -1330,11 +1331,15 @@ async def result_sender(app: Application) -> None:
         await asyncio.sleep(5)
         try:
             with db_conn() as conn:
+                # research-задачи (фото+УТП для контент-завода) рассылать не надо:
+                # их результат и ошибки забирает/алертит content-factory сам.
                 done_rows   = conn.execute(
-                    "SELECT * FROM jobs WHERE status='done'   AND result_sent=0 ORDER BY id"
+                    "SELECT * FROM jobs WHERE status='done'   AND result_sent=0 "
+                    "AND mode != 'research' ORDER BY id"
                 ).fetchall()
                 failed_rows = conn.execute(
-                    "SELECT * FROM jobs WHERE status='failed' AND result_sent=0 ORDER BY id"
+                    "SELECT * FROM jobs WHERE status='failed' AND result_sent=0 "
+                    "AND mode != 'research' ORDER BY id"
                 ).fetchall()
 
             for row in done_rows:
