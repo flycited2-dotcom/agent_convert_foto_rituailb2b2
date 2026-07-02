@@ -67,17 +67,22 @@ class Mode:
     gdrive_folder_id: str = ""
     # ID Telegram-канала для пересылки готовых карточек. Пусто — не пересылаем.
     telegram_channel_id: str = ""
+    # False — режиму не нужны эталоны стиля (research: текст+веб-поиск, не карточка).
+    requires_reference: bool = True
 
     @property
     def is_configured(self) -> bool:
-        """Готов ли режим к работе: есть URL, есть промпт, есть хотя бы 1 эталон."""
+        """Готов ли режим к работе: есть URL, есть промпт, есть хотя бы 1 эталон
+        (для режимов с requires_reference)."""
         if not self.enabled:
             return False
         if not self.project_url:
             return False
         if not self.prompt or not self.prompt.strip():
             return False
-        return any(f.exists() for f in self.reference_files) and bool(self.reference_files)
+        if self.requires_reference:
+            return any(f.exists() for f in self.reference_files) and bool(self.reference_files)
+        return True
 
     def render_prompt(self, specs: str | None = None) -> str:
         """Подставить характеристики в плейсхолдер {{SPECS}}."""
@@ -175,6 +180,18 @@ MODES: dict[str, Mode] = {
         default_specs="",
         gdrive_folder_id=os.getenv("KBT_GDRIVE_FOLDER_ID", "").strip(),
         telegram_channel_id=os.getenv("KBT_TELEGRAM_CHANNEL_ID", "").strip(),
+    ),
+    # research — не карточка: по наименованию найти в интернете УТП и изображение
+    # товара (для контент-завода). Эталоны не нужны, {{SPECS}} = «Категория Бренд Модель».
+    "research": Mode(
+        key="research",
+        label="🔎 Research (фото+УТП по названию)",
+        project_url=os.getenv("RESEARCH_PROJECT_URL", "").strip(),
+        reference_files=[],
+        prompt=_mode_prompt("research", "RESEARCH_PROMPT"),
+        enabled=True,
+        requires_specs=True,
+        requires_reference=False,
     ),
 }
 
