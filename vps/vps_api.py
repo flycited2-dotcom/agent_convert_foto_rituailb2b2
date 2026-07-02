@@ -276,3 +276,58 @@ async def submit_job(
         conn.commit()
 
     return {"ok": True, "queued": filename}
+
+
+@app.post("/api/submit-research")
+async def submit_research(
+    x_agent_token: str = Header(...),
+    brand: str = Form(""),
+    model: str = Form(...),
+    category: str = Form(""),
+    chat_id: int = Form(...),
+):
+    """content-factory ставит research-задачу: по наименованию найти фото + УТП.
+    Входного фото НЕТ (input_filename='') — агент ветвится по mode='research'
+    ДО проверки битой задачи. category кладём в specs (промпту нужен тип товара)."""
+    _auth(x_agent_token)
+    with db_conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO jobs (chat_id, input_filename, mode, specs, brand, model) "
+            "VALUES (?, '', 'research', ?, ?, ?)",
+            (chat_id, category or None, brand or None, model),
+        )
+        conn.commit()
+        job_id = cur.lastrowid
+    log.info("submit-research: brand=%s model=%s → job %d", brand, model, job_id)
+    return {"ok": True, "job_id": job_id}
+
+
+@app.post("/api/complete-research/{job_id}")
+async def complete_research(
+    job_id: int,
+    x_agent_token: str = Header(...),
+    utp: str = Form(""),
+    photo: UploadFile | None = File(None),
+):
+    """Агент возвращает результат research: текст УТП + (опционально) фото товара.
+    result_sent=1 сразу — result_sender бота эти задачи не рассылает
+    (их забирает content-factory из queue.db/OUTPUT_DIR)."""
+    _auth(x_agent_token)
+    with db_conn() as conn:
+        row = conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Job not found")
+    out_filename = None
+    if photo is not None:
+        ext = Path(photo.filename or "r.png").suffix.lower() or ".png"
+        out_filename = f"research_{job_id}{ext}"
+        (OUTPUT_DIR / out_filename).write_bytes(await photo.read())
+    with db_conn() as conn:
+        conn.execute(
+            "UPDATE jobs SET status='done', output_filename=?, result_specs=?, "
+            "result_sent=1, updated_at=? WHERE id=?",
+            (out_filename, utp or None, datetime.now().isoformat(), job_id),
+        )
+        conn.commit()
+    log.info("Research %d done: фото=%s, УТП=%d симв.", job_id, out_filename, len(utp or ""))
+    return {"ok": True, "output": out_filename}
