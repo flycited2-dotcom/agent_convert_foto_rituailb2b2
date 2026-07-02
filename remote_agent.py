@@ -158,7 +158,9 @@ async def agent_loop(api_url: str) -> None:
                             if attempt > 1:
                                 log.warning("research: попытка %d/3 для задачи %d…",
                                             attempt, job_id)
-                                await asyncio.sleep(15)
+                                # пауза побольше: не долбить ChatGPT (жалоба на
+                                # «слишком много запросов» 2026-07-02)
+                                await asyncio.sleep(60)
                             photo, utp = await process_research(
                                 job_brand, job_model, job_specs)
                             files = None
