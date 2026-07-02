@@ -36,7 +36,7 @@ logging.basicConfig(
 log = logging.getLogger("remote_agent")
 
 from config import CHROME_CDP_URL, DELAY_BETWEEN_JOBS_SEC, GDRIVE_CREDENTIALS_JSON, GDRIVE_FOLDER_ID, get_mode  # noqa: E402
-from agent import process_one_file  # noqa: E402
+from agent import process_one_file, process_research  # noqa: E402
 from ssh_tunnel import SSHTunnel  # noqa: E402
 from worker_lease_client import claim_lease  # noqa: E402
 
@@ -147,6 +147,45 @@ async def agent_loop(api_url: str) -> None:
                     job_id, job_mode, job_brand or "-", job_model or "-",
                     len(job_specs or ""), input_filename,
                 )
+
+                if job_mode == "research":
+                    # research: входного фото НЕТ (input_filename='') — это не битая
+                    # задача. ChatGPT ищет УТП + генерит изображение по наименованию.
+                    last_error = None
+                    for attempt in range(1, 4):
+                        try:
+                            if attempt > 1:
+                                log.warning("research: попытка %d/3 для задачи %d…",
+                                            attempt, job_id)
+                                await asyncio.sleep(15)
+                            photo, utp = await process_research(
+                                job_brand, job_model, job_specs)
+                            files = None
+                            if photo and photo.exists():
+                                files = {"photo": (photo.name, photo.read_bytes(),
+                                                   "image/png")}
+                            r = await client.post(
+                                f"{api_url}/api/complete-research/{job_id}",
+                                headers=headers, data={"utp": utp}, files=files,
+                                timeout=120)
+                            r.raise_for_status()
+                            if photo:
+                                photo.unlink(missing_ok=True)
+                            last_error = None
+                            break
+                        except Exception as e:
+                            last_error = e
+                            log.warning("research: попытка %d/3 не удалась: %s", attempt, e)
+                    if last_error is not None:
+                        log.error("research-задача %d провалилась: %s", job_id, last_error)
+                        try:
+                            await client.post(f"{api_url}/api/fail/{job_id}",
+                                              headers=headers,
+                                              data={"error": str(last_error)})
+                        except Exception:
+                            pass
+                    await asyncio.sleep(DELAY_BETWEEN_JOBS_SEC)
+                    continue
 
                 if not input_filename:
                     # Битая задача (например, после повреждения queue.db) —
