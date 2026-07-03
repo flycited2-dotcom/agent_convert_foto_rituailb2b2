@@ -227,6 +227,8 @@ def main() -> None:
                                 log.info("Команда STOP из Telegram.")
                                 set_desired_state("stopped")
                                 kill_agent()
+                                kill_chrome()  # иначе ботовский Chrome с открытым ChatGPT
+                                                # висит без дела до следующего "start"
 
                             # Самовосстановление раз в ~минуту: если должны
                             # работать, а Chrome/агент умерли — поднимаем.

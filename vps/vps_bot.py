@@ -607,15 +607,17 @@ async def cmd_restart_agent(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def cmd_stop_agent(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Кнопка «⛔ Стоп агента»: вотчдог убьёт remote_agent.py.
-    Фото будут копиться в очереди до следующего запуска."""
+    """Кнопка «⛔ Стоп агента»: вотчдог убьёт remote_agent.py И ботовский Chrome
+    (иначе Chrome с открытым ChatGPT просто висит без дела до следующего "start").
+    Сам вотчдог остаётся живым — иначе Telegram потерял бы возможность запустить
+    обратно дистанционно (некому было бы слушать команду). Фото копятся в очереди."""
     if not update.effective_user or not _allowed(update.effective_user.id):
         return
 
     _set_agent_flag("stop")
     await update.message.reply_text(
         "⛔ Команда на остановку отправлена.\n"
-        "Новые фото будут копиться в очереди.\n"
+        "Агент и Chrome закроются, новые фото будут копиться в очереди.\n"
         f"Запустить снова — кнопкой «{BTN_START_AGENT}».",
         reply_markup=MAIN_KEYBOARD,
     )
