@@ -132,12 +132,14 @@ async def complete_job(
         out_filename = f"split_{ts}_{job_id:03d}.png"
 
     out_path = OUTPUT_DIR / out_filename
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)  # каталоги иногда пропадают (2026-07-02/03)
     out_path.write_bytes(await result.read())
 
     # Архивируем входное фото
     src = INPUT_DIR / row["input_filename"]
     archived_name = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{row['input_filename']}"
     if src.exists():
+        PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
         src.rename(PROCESSED_DIR / archived_name)
 
     with db_conn() as conn:
@@ -229,6 +231,7 @@ async def fail_job(
     if src.exists():
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         failed_filename = f"{ts}_{row['input_filename']}"
+        FAILED_DIR.mkdir(parents=True, exist_ok=True)
         src.rename(FAILED_DIR / failed_filename)
 
     with db_conn() as conn:
@@ -267,6 +270,7 @@ async def submit_job(
     ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
     ext = Path(photo.filename or "input.jpg").suffix.lower() or ".jpg"
     filename = f"ext_{ts}{ext}"
+    INPUT_DIR.mkdir(parents=True, exist_ok=True)   # каталог иногда пропадает (2026-07-02/03)
     (INPUT_DIR / filename).write_bytes(await photo.read())
 
     log.info("submit-job: mode=%s brand=%s model=%s chat_id=%s file=%s",
@@ -327,6 +331,7 @@ async def complete_research(
     if photo is not None:
         ext = Path(photo.filename or "r.png").suffix.lower() or ".png"
         out_filename = f"research_{job_id}{ext}"
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         (OUTPUT_DIR / out_filename).write_bytes(await photo.read())
     with db_conn() as conn:
         conn.execute(
