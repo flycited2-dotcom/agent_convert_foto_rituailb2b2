@@ -25,6 +25,7 @@ from config import (
     PROCESSED_DIR,
     get_mode,
 )
+from upload_cooldown import is_upload_limit_error
 
 logging.basicConfig(
     level=logging.INFO,
@@ -118,6 +119,12 @@ async def paste_image(page: Page, image_path: Path, settle_seconds: float = 4.0)
     await asyncio.sleep(0.3)
     await page.keyboard.press("Control+V")
     await asyncio.sleep(settle_seconds)
+    # Fail fast, а не молча продолжать с недовложенной картинкой: без этой проверки
+    # агент вставлял бы оставшиеся файлы, жал Submit почти пустым сообщением и получал
+    # от ChatGPT текстовый отказ «не вижу Фото 1-4» вместо явной ошибки (2026-07-03).
+    banner = await _upload_limit_banner_text(page)
+    if banner:
+        raise UploadLimitError(banner.strip()[:200])
 
 
 async def paste_text(page: Page, text: str) -> None:
@@ -131,6 +138,23 @@ async def paste_text(page: Page, text: str) -> None:
     await asyncio.sleep(0.3)
     await page.keyboard.insert_text(text)
     await asyncio.sleep(0.5)
+
+
+class UploadLimitError(RuntimeError):
+    """ChatGPT отказал в загрузке файла — исчерпан лимит ("Максимальное количество
+    загрузок 0 за раз"). Отличаем от обычного таймаута: здесь ретраить в лоб бессмысленно
+    и вредно — квота меньше всего восстановится, если долбить её ретраями (2026-07-03)."""
+
+
+async def _upload_limit_banner_text(page: Page) -> str | None:
+    """Текст красного баннера OpenAI об исчерпанном лимите загрузок, если он сейчас
+    виден на странице, иначе None."""
+    try:
+        text = await page.evaluate(
+            "() => document.body ? document.body.innerText : ''")
+    except Exception:
+        return None
+    return text if is_upload_limit_error(text) else None
 
 
 async def submit(page: Page) -> None:
@@ -150,6 +174,13 @@ async def submit(page: Page) -> None:
         )
         if not is_disabled:
             break
+        if elapsed % 5 == 0:
+            # Fail fast: если ChatGPT уже показал «лимит загрузок», ждать до 120 сек
+            # (а потом ещё 2 повторные попытки в remote_agent.py) бессмысленно —
+            # send-button не разблокируется, пока файл не загрузился.
+            banner = await _upload_limit_banner_text(page)
+            if banner:
+                raise UploadLimitError(banner.strip()[:200])
         if elapsed % 15 == 0:
             log.info("Жду готовности send-button… %d сек", elapsed)
         await asyncio.sleep(1)

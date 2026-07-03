@@ -20,6 +20,8 @@ from dotenv import load_dotenv
 ROOT = Path(__file__).resolve().parent
 load_dotenv(ROOT / ".env")
 
+from datetime import datetime, timedelta  # noqa: E402
+
 # Логирование настраиваем ДО импорта agent.py — иначе agent.basicConfig
 # перехватит все логи в agent.log. force=True перебивает любой предыдущий конфиг.
 _LOGS_DIR = ROOT / os.getenv("LOGS_DIR", "logs")
@@ -36,9 +38,16 @@ logging.basicConfig(
 log = logging.getLogger("remote_agent")
 
 from config import CHROME_CDP_URL, DELAY_BETWEEN_JOBS_SEC, GDRIVE_CREDENTIALS_JSON, GDRIVE_FOLDER_ID, get_mode  # noqa: E402
-from agent import process_one_file, process_research  # noqa: E402
+from agent import UploadLimitError, process_one_file, process_research  # noqa: E402
 from ssh_tunnel import SSHTunnel  # noqa: E402
 from worker_lease_client import claim_lease  # noqa: E402
+import upload_cooldown  # noqa: E402
+
+# Кулдаун при «Максимальное количество загрузок» — persistентный файл (переживает
+# рестарт процесса/ПК), см. upload_cooldown.py. Retry-шторм 2026-07-03 не давал
+# квоте ChatGPT восстановиться весь день — с кулдауном агент вместо этого замолкает.
+COOLDOWN_PATH = _LOGS_DIR / "upload_cooldown_until.txt"
+COOLDOWN_MINUTES = int(os.getenv("UPLOAD_COOLDOWN_MINUTES", "45"))
 
 # --- SSH / API config (из .env) ---
 VPS_SSH_HOST  = os.getenv("VPS_SSH_HOST", "186.246.44.204")
@@ -82,6 +91,7 @@ async def agent_loop(api_url: str) -> None:
     log.info("Агент запущен. API: %s  Опрос каждые %d сек.", api_url, POLL_INTERVAL)
 
     net_errors = 0  # подряд идущих сетевых ошибок (2 → пересоздаём туннель)
+    _last_cooldown_log: datetime | None = None  # троттлинг: не спамить лог каждые POLL_INTERVAL
 
     # trust_env=False отключает системный прокси Windows (иначе 503 через Clash/v2ray)
     async with httpx.AsyncClient(timeout=30, trust_env=False) as client:
@@ -107,6 +117,16 @@ async def agent_loop(api_url: str) -> None:
                     await client.post(f"{api_url}/api/heartbeat", headers=headers)
                 except Exception:
                     pass
+
+                # --- Кулдаун после «Максимальное количество загрузок» ---
+                now = datetime.now()
+                if upload_cooldown.in_cooldown(COOLDOWN_PATH, now):
+                    if _last_cooldown_log is None or (now - _last_cooldown_log) > timedelta(minutes=5):
+                        until = upload_cooldown.read_cooldown(COOLDOWN_PATH)
+                        log.info("В кулдауне из-за лимита загрузок ChatGPT до %s — жду.", until)
+                        _last_cooldown_log = now
+                    await asyncio.sleep(POLL_INTERVAL)
+                    continue
 
                 # --- Failover-лиз: если активен другой воркер, в standby ---
                 if WORKER_ID:
@@ -228,6 +248,17 @@ async def agent_loop(api_url: str) -> None:
                             last_error = None
                             break  # успех
 
+                        except UploadLimitError as e:
+                            # Ретраить бессмысленно и вредно: квота меньше всего
+                            # восстановится, если долбить её ретраями (2026-07-03).
+                            # Уходим в кулдаун и НЕ жжём оставшиеся попытки.
+                            last_error = e
+                            until = upload_cooldown.start_cooldown(
+                                COOLDOWN_PATH, datetime.now(), COOLDOWN_MINUTES)
+                            log.error(
+                                "Задача %d: лимит загрузок ChatGPT исчерпан (%s) — "
+                                "кулдаун до %s, попытки не трачу.", job_id, e, until)
+                            break
 
                         except Exception as e:
                             last_error = e
