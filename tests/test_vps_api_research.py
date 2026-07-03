@@ -100,6 +100,23 @@ class ResearchApiTest(unittest.TestCase):
         self.assertEqual(r.json()["id"], job_id)
         self.assertEqual(r.json()["mode"], "research")
 
+    def test_agent_command_worker_scoped_flags(self):
+        """Адресные флаги: ноут забирает только свой ключ, десктоп (без worker) — общий."""
+        con = sqlite3.connect(self.db)
+        con.execute("CREATE TABLE IF NOT EXISTS flags (key TEXT PRIMARY KEY, value TEXT)")
+        con.execute("INSERT INTO flags VALUES ('agent_command', 'stop')")
+        con.execute("INSERT INTO flags VALUES ('agent_command_laptop', 'start')")
+        con.commit()
+        con.close()
+        r1 = self.client.get("/api/agent-command", headers={"x-agent-token": "T"},
+                             params={"worker": "laptop"})
+        self.assertEqual(r1.json()["command"], "start")     # ноут взял свой
+        r2 = self.client.get("/api/agent-command", headers={"x-agent-token": "T"})
+        self.assertEqual(r2.json()["command"], "stop")      # старый десктоп — общий
+        r3 = self.client.get("/api/agent-command", headers={"x-agent-token": "T"},
+                             params={"worker": "laptop"})
+        self.assertEqual(r3.json()["command"], "none")      # one-shot: повторно пусто
+
     def test_bad_token_rejected(self):
         r = self.client.post("/api/submit-research", headers={"x-agent-token": "BAD"},
                              data={"brand": "B", "model": "M", "chat_id": "1"})

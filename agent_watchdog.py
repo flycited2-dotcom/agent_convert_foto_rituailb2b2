@@ -51,6 +51,7 @@ VPS_API_PORT   = int(os.getenv("VPS_API_PORT", "8765"))
 VPS_API_TOKEN  = os.getenv("VPS_API_TOKEN", "")
 CHROME_CDP_URL = os.getenv("CHROME_CDP_URL", "http://127.0.0.1:9333").rstrip("/")
 POLL_SEC       = int(os.getenv("WATCHDOG_POLL_SEC", "15"))
+WORKER_ID      = os.getenv("WORKER_ID", "").strip()   # адресные флаги: agent_command_<id>
 
 
 # Фильтр процессов ТОЛЬКО по python/pythonw — иначе match по cmdline ловит
@@ -203,10 +204,14 @@ def main() -> None:
                 with httpx.Client(timeout=15, trust_env=False) as client:
                     while True:
                         try:
-                            r = client.get(f"{api_url}/api/agent-command", headers=headers)
+                            params = {"worker": WORKER_ID} if WORKER_ID else None
+                            r = client.get(f"{api_url}/api/agent-command",
+                                           headers=headers, params=params)
                             r.raise_for_status()
                             errors = 0
                             cmd = r.json().get("command")
+                            if cmd in ("", "none"):   # API отдаёт строку "none", не None!
+                                cmd = None            # иначе самовосстановление ниже не работает
                             if cmd == "start":
                                 log.info("Команда START из Telegram.")
                                 set_desired_state("running")

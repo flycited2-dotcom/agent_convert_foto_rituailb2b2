@@ -509,14 +509,19 @@ def _agent_hb_age() -> float | None:
     return (datetime.now() - datetime.fromisoformat(row["seen_at"])).total_seconds()
 
 
+# Ключи флагов: общий (старые вотчдоги — десктоп до Task 7) + адресный ноута.
+# Кнопки бота ставят команду ВСЕМ машинам (каждая заберёт свой ключ один раз);
+# адресное управление одной машиной — записью только её ключа (скриптом).
+_AGENT_FLAG_KEYS = ("agent_command", "agent_command_laptop")
+
+
 def _set_agent_flag(command: str) -> None:
-    """Ставит команду для вотчдога на локальном ПК (исполняется один раз)."""
+    """Ставит команду для вотчдогов на локальных ПК (исполняется один раз каждой)."""
     with db_conn() as conn:
         conn.execute("CREATE TABLE IF NOT EXISTS flags (key TEXT PRIMARY KEY, value TEXT)")
-        conn.execute(
-            "INSERT OR REPLACE INTO flags (key, value) VALUES ('agent_command', ?)",
-            (command,),
-        )
+        for key in _AGENT_FLAG_KEYS:
+            conn.execute("INSERT OR REPLACE INTO flags (key, value) VALUES (?, ?)",
+                         (key, command))
         conn.commit()
 
 

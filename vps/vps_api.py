@@ -154,16 +154,20 @@ async def complete_job(
 
 
 @app.get("/api/agent-command")
-def agent_command(x_agent_token: str = Header(...)):
+def agent_command(x_agent_token: str = Header(...), worker: str = ""):
     """Вотчдог на локальном ПК поллит сюда. Отдаём команду и сразу сбрасываем,
-    чтобы она исполнилась ровно один раз."""
+    чтобы она исполнилась ровно один раз. `worker` — адресный флаг конкретной
+    машины (agent_command_<worker>); без параметра — общий ключ agent_command
+    (старые вотчдоги: десктоп до Task 7). Так команды не перехватываются
+    чужой машиной (конфликт десктоп/ноут 2026-07-03)."""
     _auth(x_agent_token)
+    key = f"agent_command_{worker}" if worker else "agent_command"
     with db_conn() as conn:
         conn.execute("CREATE TABLE IF NOT EXISTS flags (key TEXT PRIMARY KEY, value TEXT)")
-        row = conn.execute("SELECT value FROM flags WHERE key='agent_command'").fetchone()
+        row = conn.execute("SELECT value FROM flags WHERE key=?", (key,)).fetchone()
         cmd = row["value"] if row else None
         if cmd:
-            conn.execute("DELETE FROM flags WHERE key='agent_command'")
+            conn.execute("DELETE FROM flags WHERE key=?", (key,))
         conn.commit()
     return {"command": cmd or "none"}
 
