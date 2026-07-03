@@ -197,6 +197,10 @@ MODES: dict[str, Mode] = {
 
 DEFAULT_MODE = "ritual"
 
+# Второй шаг research-задачи: запрос изображения ОТДЕЛЬНЫМ сообщением (после УТП).
+# Причина: в одном запросе модель часто сразу генерит картинку и не пишет список УТП.
+RESEARCH_IMAGE_PROMPT = _mode_prompt("research_image", "RESEARCH_IMAGE_PROMPT")
+
 
 def get_mode(key: str | None) -> Mode:
     """Безопасно достать режим по key. Если ключа нет — возвращает default."""

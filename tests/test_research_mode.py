@@ -25,3 +25,9 @@ def test_render_prompt_substitutes_product():
 
 def test_other_modes_still_require_reference():
     assert get_mode("conditioner").requires_reference is True
+
+
+def test_research_image_prompt_configured():
+    import config
+    assert "{{SPECS}}" in config.RESEARCH_IMAGE_PROMPT
+    assert "изображение" in config.RESEARCH_IMAGE_PROMPT.lower()

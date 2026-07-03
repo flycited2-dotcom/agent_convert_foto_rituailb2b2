@@ -413,17 +413,36 @@ ASSISTANT_TEXT_JS = """
 """
 
 
+async def wait_for_utp(page: Page, timeout_sec: int = 270) -> list[str]:
+    """Поллинг ответа до появления стабильного списка УТП (модель с веб-поиском
+    думает 1–3 мин). Готово = ≥3 пунктов и список не меняется два цикла подряд."""
+    utp, stable = [], 0
+    for _ in range(max(1, timeout_sec // 3)):
+        await asyncio.sleep(3)
+        text = await page.evaluate(ASSISTANT_TEXT_JS)
+        cur = parse_utp_lines(text)
+        if len(cur) >= 3:
+            stable = stable + 1 if cur == utp else 0
+            utp = cur
+            if stable >= 2:
+                return utp
+        else:
+            utp, stable = cur, 0
+    return utp if len(utp) >= 3 else []
+
+
 async def process_research(brand: str | None, model: str | None,
                            category: str | None) -> tuple[Path | None, str]:
-    """Research-задача: без входного фото. Открывает research-проект (веб-поиск),
-    спрашивает УТП + изображение товара. Возвращает (путь к картинке | None, текст УТП).
-    Нет списка УТП в ответе = исключение (ретраи делает remote_agent, как у карточек);
-    нет картинки — НЕ ошибка (фолбэк спеки: карточка потом генерится «по названию»)."""
+    """Research-задача: без входного фото. ДВА сообщения в одном чате:
+    (1) только список УТП (модели явно запрещаем генерить картинку — иначе она
+    рисует сразу и текст не пишет); (2) изображение товара отдельным запросом.
+    Возвращает (путь к картинке | None, текст УТП). Нет УТП = исключение (ретраи
+    в remote_agent); нет картинки — не ошибка (карточка потом «по названию»)."""
+    from config import RESEARCH_IMAGE_PROMPT
     cfg = get_mode("research")
     if cfg.key != "research" or not cfg.is_configured:
         raise RuntimeError("Режим 'research' не настроен: нет RESEARCH_PROJECT_URL/промпта")
     product = " ".join(x for x in (category, brand, model) if x).strip()
-    prompt = cfg.render_prompt(product)
     output_path = make_output_path(mode="research", brand=brand, model=model)
 
     async with async_playwright() as p:
@@ -431,27 +450,30 @@ async def process_research(brand: str | None, model: str | None,
         try:
             page = await find_or_open_chatgpt(browser)
             await open_new_chat(page, url=cfg.project_url or "https://chatgpt.com/")
-            await paste_text(page, prompt)
-            await submit(page)
-            await asyncio.sleep(5)
-            baseline_srcs = await snapshot_image_srcs(page)
 
+            # Шаг 1: только УТП (текст)
+            await paste_text(page, cfg.render_prompt(product))
+            await submit(page)
+            utp = await wait_for_utp(page)
+            if not utp:
+                await _dump_page_state(page, "research_utp")
+                raise RuntimeError("research: в ответе не найден список УТП")
+            log.info("research: %d УТП получено, запрашиваю изображение…", len(utp))
+
+            # Шаг 2: изображение отдельным сообщением (тот же чат)
             photo: Path | None = None
             try:
+                await asyncio.sleep(2)
+                await paste_text(page, RESEARCH_IMAGE_PROMPT.replace("{{SPECS}}", product))
+                await submit(page)
+                await asyncio.sleep(5)
+                baseline_srcs = await snapshot_image_srcs(page)
                 await wait_for_generation(page, GENERATION_TIMEOUT_SEC * 1000, baseline_srcs)
                 await download_via_anchor(page, output_path, baseline_srcs)
                 photo = output_path
             except Exception as e:
                 log.warning("research: изображение не получено (%s) — вернём только УТП", e)
 
-            text = await page.evaluate(ASSISTANT_TEXT_JS)
-            utp = parse_utp_lines(text)
-            if not utp:
-                # дамп страницы (скрин+img-json в logs/) + фрагмент ответа в ошибку —
-                # иначе причину «нет УТП» не диагностировать
-                await _dump_page_state(page, "research_utp")
-                frag = " | ".join((text or "").split("\n"))[:350]
-                raise RuntimeError(f"research: в ответе не найден список УТП; ответ: {frag!r}")
             log.info("research: %d УТП, фото=%s", len(utp), photo.name if photo else "нет")
             return photo, "\n".join(utp)
         finally:
