@@ -381,13 +381,32 @@ def parse_utp_lines(text: str | None, max_items: int = 7) -> list[str]:
 # (текст с УТП + отдельное сообщение-изображение) — последнее может быть без текста.
 # <li> собираем отдельно с префиксом «- »: маркеры markdown-списков рисуются CSS
 # (::marker) и в innerText НЕ попадают — без префикса парсер УТП их не увидит.
+# Фолбэк: у части ответов assistant-роль в DOM отсутствует (новый рендер/AB) —
+# тогда берём li вне user-сообщений + строки на «✓» из main (наш промпт — плоский
+# текст без li и без строк, начинающихся с «✓», так что он не подмешается).
 ASSISTANT_TEXT_JS = """
     () => {
-        const sel = '[data-message-author-role="assistant"], [data-author-role="assistant"]';
+        const asel = '[data-message-author-role="assistant"], [data-author-role="assistant"]';
+        const usel = '[data-message-author-role="user"], [data-author-role="user"]';
         const out = [];
-        for (const m of document.querySelectorAll(sel)) {
-            for (const li of m.querySelectorAll('li')) out.push('- ' + li.innerText);
-            out.push(m.innerText);
+        const aMsgs = [...document.querySelectorAll(asel)];
+        if (aMsgs.length) {
+            for (const m of aMsgs) {
+                for (const li of m.querySelectorAll('li')) out.push('- ' + li.innerText);
+                out.push(m.innerText);
+            }
+            return out.join('\\n');
+        }
+        const uMsgs = [...document.querySelectorAll(usel)];
+        const inUser = el => uMsgs.some(m => m.contains(el));
+        for (const li of document.querySelectorAll('main li')) {
+            if (!inUser(li)) out.push('- ' + li.innerText);
+        }
+        const mainEl = document.querySelector('main');
+        if (mainEl) {
+            for (const line of mainEl.innerText.split('\\n')) {
+                if (line.trim().startsWith('✓')) out.push(line.trim());
+            }
         }
         return out.join('\\n');
     }
@@ -428,8 +447,9 @@ async def process_research(brand: str | None, model: str | None,
             text = await page.evaluate(ASSISTANT_TEXT_JS)
             utp = parse_utp_lines(text)
             if not utp:
-                # фрагмент ответа кладём в ошибку (уйдёт в error_text задачи) —
-                # иначе причину «нет УТП» с другой машины не диагностировать
+                # дамп страницы (скрин+img-json в logs/) + фрагмент ответа в ошибку —
+                # иначе причину «нет УТП» не диагностировать
+                await _dump_page_state(page, "research_utp")
                 frag = " | ".join((text or "").split("\n"))[:350]
                 raise RuntimeError(f"research: в ответе не найден список УТП; ответ: {frag!r}")
             log.info("research: %d УТП, фото=%s", len(utp), photo.name if photo else "нет")
