@@ -434,6 +434,8 @@ BTN_RESTART      = "♻️ Рестарт зависших"
 BTN_START_AGENT  = "🚀 Запустить агента"
 BTN_RESTART_AGENT = "🔁 Перезапуск агента"
 BTN_STOP_AGENT   = "⛔ Стоп агента"
+BTN_ONLY_LAPTOP  = "🖥 Только ноут"
+BTN_ONLY_DESKTOP = "🖳 Только десктоп"
 BTN_HIDE         = "🔙 Скрыть меню"
 
 # Reply-клавиатура: режимы / характеристики+статус / действия.
@@ -448,6 +450,7 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
         [KeyboardButton(BTN_CANCEL_LAST), KeyboardButton(BTN_CLEAR)],
         [KeyboardButton(BTN_RESTART), KeyboardButton(BTN_START_AGENT)],
         [KeyboardButton(BTN_RESTART_AGENT), KeyboardButton(BTN_STOP_AGENT)],
+        [KeyboardButton(BTN_ONLY_LAPTOP), KeyboardButton(BTN_ONLY_DESKTOP)],
         [KeyboardButton(BTN_HIDE)],
     ],
     resize_keyboard=True,
@@ -522,6 +525,22 @@ def _set_agent_flag(command: str) -> None:
         for key in _AGENT_FLAG_KEYS:
             conn.execute("INSERT OR REPLACE INTO flags (key, value) VALUES (?, ?)",
                          (key, command))
+        conn.commit()
+
+
+def _set_exclusive_worker(active: str) -> None:
+    """Ровно одна машина активна: выбранная получает 'start', другая — 'stop'
+    (обе команды в одном атомарном действии, чтобы очередь не грызли обе разом —
+    десктоп со старым кодом лиз не спрашивает, конфликт 2026-07-03/05).
+    active: 'laptop' | 'desktop'."""
+    if active not in ("laptop", "desktop"):
+        raise ValueError(f"неизвестная машина: {active!r} (ожидались laptop/desktop)")
+    with db_conn() as conn:
+        conn.execute("CREATE TABLE IF NOT EXISTS flags (key TEXT PRIMARY KEY, value TEXT)")
+        conn.execute("INSERT OR REPLACE INTO flags (key, value) VALUES (?, ?)",
+                     ("agent_command_laptop", "start" if active == "laptop" else "stop"))
+        conn.execute("INSERT OR REPLACE INTO flags (key, value) VALUES (?, ?)",
+                     ("agent_command", "start" if active == "desktop" else "stop"))
         conn.commit()
 
 
@@ -640,6 +659,52 @@ async def cmd_stop_agent(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
             pass
 
     asyncio.create_task(_confirm())
+
+
+async def _cmd_exclusive_worker(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
+                                active: str, label: str) -> None:
+    """Общая реализация кнопок «Только ноут»/«Только десктоп»: ровно одна
+    машина остаётся активной (_set_exclusive_worker), другая получает stop —
+    иначе обе продолжают грызть очередь параллельно (десктоп со старым кодом
+    лиз не спрашивает, конфликт 2026-07-03/05)."""
+    if not update.effective_user or not _allowed(update.effective_user.id):
+        return
+
+    _set_exclusive_worker(active)
+    await update.message.reply_text(
+        f"🔀 Команда отправлена: активен только {label}, вторая машина — стоп.\n"
+        "Вотчдоги подхватят в течение ~15 сек.\n"
+        "⚠️ Heartbeat в базе общий на обе машины — подтверждение ниже покажет "
+        "только «есть ли связь хоть с кем-то», не «именно с нужной машиной».",
+        reply_markup=MAIN_KEYBOARD,
+    )
+
+    chat_id = update.effective_chat.id
+
+    async def _confirm() -> None:
+        await asyncio.sleep(120)
+        age2 = _agent_hb_age()
+        ok = age2 is not None and age2 < 60
+        try:
+            if ok:
+                await ctx.bot.send_message(chat_id, f"✅ Связь есть (ожидаем {label}).")
+            else:
+                await ctx.bot.send_message(
+                    chat_id, f"❌ Никто не на связи — проверь вотчдог на {label}.")
+        except Exception:
+            pass
+
+    asyncio.create_task(_confirm())
+
+
+async def cmd_only_laptop(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Кнопка «🖥 Только ноут»: ноут — start, десктоп — stop."""
+    await _cmd_exclusive_worker(update, ctx, "laptop", "ноут")
+
+
+async def cmd_only_desktop(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Кнопка «🖳 Только десктоп»: десктоп — start, ноут — stop."""
+    await _cmd_exclusive_worker(update, ctx, "desktop", "десктоп")
 
 
 async def cmd_last(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
@@ -969,6 +1034,10 @@ async def on_keyboard_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
         await cmd_restart_agent(update, ctx)
     elif text == BTN_STOP_AGENT:
         await cmd_stop_agent(update, ctx)
+    elif text == BTN_ONLY_LAPTOP:
+        await cmd_only_laptop(update, ctx)
+    elif text == BTN_ONLY_DESKTOP:
+        await cmd_only_desktop(update, ctx)
     elif text == BTN_SPECS:
         await cmd_request_specs(update, ctx)
     elif text == BTN_HIDE:
@@ -1567,7 +1636,7 @@ def main() -> None:
 
     # Reply-клавиатура шлёт обычный текст — ловим точные совпадения с подписями кнопок
     import re
-    button_labels = list(MODES_LABELS.values()) + [BTN_SPECS, BTN_STATUS, BTN_CANCEL_LAST, BTN_CLEAR, BTN_RESTART, BTN_START_AGENT, BTN_RESTART_AGENT, BTN_STOP_AGENT, BTN_HIDE]
+    button_labels = list(MODES_LABELS.values()) + [BTN_SPECS, BTN_STATUS, BTN_CANCEL_LAST, BTN_CLEAR, BTN_RESTART, BTN_START_AGENT, BTN_RESTART_AGENT, BTN_STOP_AGENT, BTN_ONLY_LAPTOP, BTN_ONLY_DESKTOP, BTN_HIDE]
     pattern = "^(" + "|".join(re.escape(b) for b in button_labels) + ")$"
     app.add_handler(MessageHandler(
         filters.TEXT & filters.Regex(pattern),
