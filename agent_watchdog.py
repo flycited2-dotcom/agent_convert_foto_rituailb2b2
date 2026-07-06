@@ -51,6 +51,7 @@ VPS_API_PORT   = int(os.getenv("VPS_API_PORT", "8765"))
 VPS_API_TOKEN  = os.getenv("VPS_API_TOKEN", "")
 CHROME_CDP_URL = os.getenv("CHROME_CDP_URL", "http://127.0.0.1:9333").rstrip("/")
 POLL_SEC       = int(os.getenv("WATCHDOG_POLL_SEC", "15"))
+WORKER_ID      = os.getenv("WORKER_ID", "").strip()   # адресные флаги: agent_command_<id>
 
 
 # Фильтр процессов ТОЛЬКО по python/pythonw — иначе match по cmdline ловит
@@ -67,7 +68,7 @@ def _count_procs(cmdline_substr: str, exclude_pid: int | None = None) -> int:
         ["powershell", "-NoProfile", "-Command",
          f"(Get-CimInstance Win32_Process | Where-Object {{{cond}}} | Measure-Object).Count"],
         capture_output=True, text=True, timeout=30,
-        creationflags=subprocess.CREATE_NO_WINDOW,   # без мелькающего окна PowerShell
+        creationflags=subprocess.CREATE_NO_WINDOW,  # не мигать окном PowerShell
     )
     if r.returncode != 0 or not r.stdout.strip().isdigit():
         return 0
@@ -94,7 +95,7 @@ def kill_agent() -> bool:
          "-and $_.CommandLine -match 'remote_agent'} "
          "| ForEach-Object { Stop-Process -Id $_.ProcessId -Force; $_.ProcessId }"],
         capture_output=True, text=True, timeout=30,
-        creationflags=subprocess.CREATE_NO_WINDOW,   # без мелькающего окна PowerShell
+        creationflags=subprocess.CREATE_NO_WINDOW,  # не мигать окном PowerShell
     )
     pids = r.stdout.strip()
     if pids:
@@ -115,7 +116,7 @@ def kill_chrome() -> bool:
          f"Get-CimInstance Win32_Process | Where-Object {{{cond}}} "
          "| ForEach-Object { Stop-Process -Id $_.ProcessId -Force; $_.ProcessId }"],
         capture_output=True, text=True, timeout=30,
-        creationflags=subprocess.CREATE_NO_WINDOW,   # без мелькающего окна PowerShell
+        creationflags=subprocess.CREATE_NO_WINDOW,  # не мигать окном PowerShell
     )
     pids = r.stdout.strip()
     if pids:
@@ -174,7 +175,7 @@ def handle_start() -> None:
     log.info("Запускаю remote_agent.py…")
     subprocess.Popen(
         [sys.executable, "remote_agent.py"],
-        cwd=ROOT, creationflags=subprocess.CREATE_NEW_CONSOLE,
+        cwd=ROOT, creationflags=subprocess.CREATE_NO_WINDOW,  # фон, без консольного окна
     )
 
 
@@ -203,10 +204,14 @@ def main() -> None:
                 with httpx.Client(timeout=15, trust_env=False) as client:
                     while True:
                         try:
-                            r = client.get(f"{api_url}/api/agent-command", headers=headers)
+                            params = {"worker": WORKER_ID} if WORKER_ID else None
+                            r = client.get(f"{api_url}/api/agent-command",
+                                           headers=headers, params=params)
                             r.raise_for_status()
                             errors = 0
                             cmd = r.json().get("command")
+                            if cmd in ("", "none"):   # API отдаёт строку "none", не None!
+                                cmd = None            # иначе самовосстановление ниже не работает
                             if cmd == "start":
                                 log.info("Команда START из Telegram.")
                                 set_desired_state("running")
@@ -222,6 +227,8 @@ def main() -> None:
                                 log.info("Команда STOP из Telegram.")
                                 set_desired_state("stopped")
                                 kill_agent()
+                                kill_chrome()  # иначе ботовский Chrome с открытым ChatGPT
+                                                # висит без дела до следующего "start"
 
                             # Самовосстановление раз в ~минуту: если должны
                             # работать, а Chrome/агент умерли — поднимаем.

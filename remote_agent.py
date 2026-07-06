@@ -20,6 +20,8 @@ from dotenv import load_dotenv
 ROOT = Path(__file__).resolve().parent
 load_dotenv(ROOT / ".env")
 
+from datetime import datetime, timedelta  # noqa: E402
+
 # Логирование настраиваем ДО импорта agent.py — иначе agent.basicConfig
 # перехватит все логи в agent.log. force=True перебивает любой предыдущий конфиг.
 _LOGS_DIR = ROOT / os.getenv("LOGS_DIR", "logs")
@@ -36,8 +38,16 @@ logging.basicConfig(
 log = logging.getLogger("remote_agent")
 
 from config import CHROME_CDP_URL, DELAY_BETWEEN_JOBS_SEC, GDRIVE_CREDENTIALS_JSON, GDRIVE_FOLDER_ID, get_mode  # noqa: E402
-from agent import process_one_file  # noqa: E402
+from agent import UploadLimitError, process_one_file, process_research  # noqa: E402
 from ssh_tunnel import SSHTunnel  # noqa: E402
+from worker_lease_client import claim_lease  # noqa: E402
+import upload_cooldown  # noqa: E402
+
+# Кулдаун при «Максимальное количество загрузок» — persistентный файл (переживает
+# рестарт процесса/ПК), см. upload_cooldown.py. Retry-шторм 2026-07-03 не давал
+# квоте ChatGPT восстановиться весь день — с кулдауном агент вместо этого замолкает.
+COOLDOWN_PATH = _LOGS_DIR / "upload_cooldown_until.txt"
+COOLDOWN_MINUTES = int(os.getenv("UPLOAD_COOLDOWN_MINUTES", "45"))
 
 # --- SSH / API config (из .env) ---
 VPS_SSH_HOST  = os.getenv("VPS_SSH_HOST", "186.246.44.204")
@@ -47,6 +57,8 @@ VPS_SSH_KEY   = os.getenv("VPS_SSH_KEY", "")
 VPS_API_PORT  = int(os.getenv("VPS_API_PORT", "8765"))
 VPS_API_TOKEN = os.getenv("VPS_API_TOKEN", "")
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL_SEC", "10"))
+WORKER_ID       = os.getenv("WORKER_ID", "").strip()
+WORKER_PRIORITY = int(os.getenv("WORKER_PRIORITY", "100"))
 
 
 # ---------------------------------------------------------------------------
@@ -79,6 +91,7 @@ async def agent_loop(api_url: str) -> None:
     log.info("Агент запущен. API: %s  Опрос каждые %d сек.", api_url, POLL_INTERVAL)
 
     net_errors = 0  # подряд идущих сетевых ошибок (2 → пересоздаём туннель)
+    _last_cooldown_log: datetime | None = None  # троттлинг: не спамить лог каждые POLL_INTERVAL
 
     # trust_env=False отключает системный прокси Windows (иначе 503 через Clash/v2ray)
     async with httpx.AsyncClient(timeout=30, trust_env=False) as client:
@@ -105,6 +118,26 @@ async def agent_loop(api_url: str) -> None:
                 except Exception:
                     pass
 
+                # --- Кулдаун после «Максимальное количество загрузок» ---
+                now = datetime.now()
+                if upload_cooldown.in_cooldown(COOLDOWN_PATH, now):
+                    if _last_cooldown_log is None or (now - _last_cooldown_log) > timedelta(minutes=5):
+                        until = upload_cooldown.read_cooldown(COOLDOWN_PATH)
+                        log.info("В кулдауне из-за лимита загрузок ChatGPT до %s — жду.", until)
+                        _last_cooldown_log = now
+                    await asyncio.sleep(POLL_INTERVAL)
+                    continue
+
+                # --- Failover-лиз: если активен другой воркер, в standby ---
+                if WORKER_ID:
+                    active = await claim_lease(client, api_url, VPS_API_TOKEN,
+                                               WORKER_ID, WORKER_PRIORITY)
+                    if not active:
+                        log.info("standby (worker=%s, активен другой) — жду %d сек.",
+                                 WORKER_ID, POLL_INTERVAL)
+                        await asyncio.sleep(POLL_INTERVAL)
+                        continue
+
                 # Chrome мёртв — задачу НЕ берём, иначе она сгорит об
                 # ECONNREFUSED за 3 быстрые попытки (грабля 2026-06-12).
                 # Поднять Chrome может вотчдог (кнопка «Запустить» в Telegram).
@@ -116,8 +149,9 @@ async def agent_loop(api_url: str) -> None:
                     await asyncio.sleep(30)
                     continue
 
-                # --- Получаем следующую задачу ---
-                r = await client.get(f"{api_url}/api/next-job", headers=headers)
+                # --- Получаем следующую задачу (caps: этот агент умеет research) ---
+                r = await client.get(f"{api_url}/api/next-job", headers=headers,
+                                     params={"caps": "research"})
                 net_errors = 0  # связь жива
                 if r.status_code == 204:
                     await asyncio.sleep(POLL_INTERVAL)
@@ -134,6 +168,47 @@ async def agent_loop(api_url: str) -> None:
                     job_id, job_mode, job_brand or "-", job_model or "-",
                     len(job_specs or ""), input_filename,
                 )
+
+                if job_mode == "research":
+                    # research: входного фото НЕТ (input_filename='') — это не битая
+                    # задача. ChatGPT ищет УТП + генерит изображение по наименованию.
+                    last_error = None
+                    for attempt in range(1, 4):
+                        try:
+                            if attempt > 1:
+                                log.warning("research: попытка %d/3 для задачи %d…",
+                                            attempt, job_id)
+                                # пауза побольше: не долбить ChatGPT (жалоба на
+                                # «слишком много запросов» 2026-07-02)
+                                await asyncio.sleep(60)
+                            photo, utp = await process_research(
+                                job_brand, job_model, job_specs)
+                            files = None
+                            if photo and photo.exists():
+                                files = {"photo": (photo.name, photo.read_bytes(),
+                                                   "image/png")}
+                            r = await client.post(
+                                f"{api_url}/api/complete-research/{job_id}",
+                                headers=headers, data={"utp": utp}, files=files,
+                                timeout=120)
+                            r.raise_for_status()
+                            if photo:
+                                photo.unlink(missing_ok=True)
+                            last_error = None
+                            break
+                        except Exception as e:
+                            last_error = e
+                            log.warning("research: попытка %d/3 не удалась: %s", attempt, e)
+                    if last_error is not None:
+                        log.error("research-задача %d провалилась: %s", job_id, last_error)
+                        try:
+                            await client.post(f"{api_url}/api/fail/{job_id}",
+                                              headers=headers,
+                                              data={"error": str(last_error)})
+                        except Exception:
+                            pass
+                    await asyncio.sleep(DELAY_BETWEEN_JOBS_SEC)
+                    continue
 
                 if not input_filename:
                     # Битая задача (например, после повреждения queue.db) —
@@ -173,6 +248,17 @@ async def agent_loop(api_url: str) -> None:
                             last_error = None
                             break  # успех
 
+                        except UploadLimitError as e:
+                            # Ретраить бессмысленно и вредно: квота меньше всего
+                            # восстановится, если долбить её ретраями (2026-07-03).
+                            # Уходим в кулдаун и НЕ жжём оставшиеся попытки.
+                            last_error = e
+                            until = upload_cooldown.start_cooldown(
+                                COOLDOWN_PATH, datetime.now(), COOLDOWN_MINUTES)
+                            log.error(
+                                "Задача %d: лимит загрузок ChatGPT исчерпан (%s) — "
+                                "кулдаун до %s, попытки не трачу.", job_id, e, until)
+                            break
 
                         except Exception as e:
                             last_error = e

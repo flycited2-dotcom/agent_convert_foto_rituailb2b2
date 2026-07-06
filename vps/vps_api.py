@@ -5,6 +5,8 @@
   GET  /api/input/{job_id}    → скачать входное фото
   POST /api/complete/{job_id} → загрузить результат (multipart: result=<file>)
   POST /api/fail/{job_id}     → пометить как ошибку (form: error=<text>)
+  POST /api/submit-job        → внешний клиент ставит задачу (multipart: photo +
+                                form mode/specs/brand/model/chat_id)
 
 Запуск: uvicorn vps_api:app --host 0.0.0.0 --port 8765
 """
@@ -21,6 +23,7 @@ from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from config_vps import API_TOKEN, DB_PATH, FAILED_DIR, INPUT_DIR, OUTPUT_DIR, PROCESSED_DIR
+from worker_lease import LEASE_TTL_SECONDS, active_worker_id
 
 log = logging.getLogger("vps_api")
 app = FastAPI(docs_url=None, redoc_url=None)  # отключаем Swagger UI в prod
@@ -46,11 +49,17 @@ def _auth(x_agent_token: str = Header(...)) -> None:
 # ---------------------------------------------------------------------------
 
 @app.get("/api/next-job")
-def next_job(x_agent_token: str = Header(...)):
+def next_job(x_agent_token: str = Header(...), caps: str = ""):
     _auth(x_agent_token)
+    # caps — возможности агента (напр. "research"). Старые агенты параметр не шлют —
+    # research-задачи им НЕ отдаём (не умеют и фейлили бы их «битой задачей»);
+    # обычные карточки отдаём всем, как раньше.
+    where = "status='pending'"
+    if "research" not in (caps or "").split(","):
+        where += " AND mode != 'research'"
     with db_conn() as conn:
         row = conn.execute(
-            "SELECT * FROM jobs WHERE status='pending' ORDER BY id LIMIT 1"
+            f"SELECT * FROM jobs WHERE {where} ORDER BY id LIMIT 1"
         ).fetchone()
         if not row:
             return JSONResponse(status_code=204, content=None)
@@ -123,12 +132,14 @@ async def complete_job(
         out_filename = f"split_{ts}_{job_id:03d}.png"
 
     out_path = OUTPUT_DIR / out_filename
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)  # каталоги иногда пропадают (2026-07-02/03)
     out_path.write_bytes(await result.read())
 
     # Архивируем входное фото
     src = INPUT_DIR / row["input_filename"]
     archived_name = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{row['input_filename']}"
     if src.exists():
+        PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
         src.rename(PROCESSED_DIR / archived_name)
 
     with db_conn() as conn:
@@ -143,18 +154,53 @@ async def complete_job(
 
 
 @app.get("/api/agent-command")
-def agent_command(x_agent_token: str = Header(...)):
+def agent_command(x_agent_token: str = Header(...), worker: str = ""):
     """Вотчдог на локальном ПК поллит сюда. Отдаём команду и сразу сбрасываем,
-    чтобы она исполнилась ровно один раз."""
+    чтобы она исполнилась ровно один раз. `worker` — адресный флаг конкретной
+    машины (agent_command_<worker>); без параметра — общий ключ agent_command
+    (старые вотчдоги: десктоп до Task 7). Так команды не перехватываются
+    чужой машиной (конфликт десктоп/ноут 2026-07-03)."""
     _auth(x_agent_token)
+    key = f"agent_command_{worker}" if worker else "agent_command"
     with db_conn() as conn:
         conn.execute("CREATE TABLE IF NOT EXISTS flags (key TEXT PRIMARY KEY, value TEXT)")
-        row = conn.execute("SELECT value FROM flags WHERE key='agent_command'").fetchone()
+        row = conn.execute("SELECT value FROM flags WHERE key=?", (key,)).fetchone()
         cmd = row["value"] if row else None
         if cmd:
-            conn.execute("DELETE FROM flags WHERE key='agent_command'")
+            conn.execute("DELETE FROM flags WHERE key=?", (key,))
         conn.commit()
     return {"command": cmd or "none"}
+
+
+@app.post("/api/worker/lease")
+def worker_lease(
+    x_agent_token: str = Header(...),
+    worker_id: str = Form(...),
+    priority: int = Form(100),
+):
+    """Воркер регистрирует heartbeat и спрашивает, активен ли он сейчас.
+    active=True → можно брать задачи; False → standby (генерит другой)."""
+    _auth(x_agent_token)
+    now = datetime.now()
+    with db_conn() as conn:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS workers ("
+            "worker_id TEXT PRIMARY KEY, priority INTEGER NOT NULL DEFAULT 100, "
+            "seen_at TEXT NOT NULL)"
+        )
+        conn.execute(
+            "INSERT INTO workers (worker_id, priority, seen_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(worker_id) DO UPDATE SET priority=excluded.priority, "
+            "seen_at=excluded.seen_at",
+            (worker_id, priority, now.isoformat()),
+        )
+        conn.commit()
+        rows = [dict(r) for r in conn.execute(
+            "SELECT worker_id, priority, seen_at FROM workers"
+        ).fetchall()]
+    active_id = active_worker_id(rows, now, LEASE_TTL_SECONDS)
+    return {"active": active_id == worker_id, "worker_id": worker_id,
+            "active_worker": active_id}
 
 
 @app.post("/api/heartbeat")
@@ -189,6 +235,7 @@ async def fail_job(
     if src.exists():
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         failed_filename = f"{ts}_{row['input_filename']}"
+        FAILED_DIR.mkdir(parents=True, exist_ok=True)
         src.rename(FAILED_DIR / failed_filename)
 
     with db_conn() as conn:
@@ -200,3 +247,102 @@ async def fail_job(
 
     log.info("Job %d failed: %s", job_id, error)
     return {"ok": True}
+
+
+@app.post("/api/submit-job")
+async def submit_job(
+    x_agent_token: str = Header(...),
+    mode: str = Form("conditioner"),
+    specs: str = Form(""),
+    brand: str = Form(""),
+    model: str = Form(""),
+    chat_id: int = Form(...),
+    caption: str = Form(""),
+    photo: UploadFile = File(...),
+):
+    """Внешний клиент (Stock Bot) ставит задачу в очередь напрямую через API.
+
+    Принимает фото товара + характеристики, создаёт pending-job в queue.db.
+    Результат уйдёт в чат chat_id через result_sender бота (для conditioner —
+    в режиме подтверждения). Возвращает имя сохранённого входного файла.
+    """
+    _auth(x_agent_token)
+
+    if mode not in ("conditioner", "ritual", "wreath", "mcp", "kbt"):
+        raise HTTPException(status_code=400, detail=f"Неизвестный режим: {mode}")
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+    ext = Path(photo.filename or "input.jpg").suffix.lower() or ".jpg"
+    filename = f"ext_{ts}{ext}"
+    INPUT_DIR.mkdir(parents=True, exist_ok=True)   # каталог иногда пропадает (2026-07-02/03)
+    (INPUT_DIR / filename).write_bytes(await photo.read())
+
+    log.info("submit-job: mode=%s brand=%s model=%s chat_id=%s file=%s",
+             mode, brand, model, chat_id, filename)
+
+    with db_conn() as conn:
+        conn.execute(
+            "INSERT INTO jobs (chat_id, input_filename, mode, specs, brand, model, caption) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (chat_id, filename, mode, specs or None, brand or None,
+             model or None, caption or None),
+        )
+        conn.commit()
+
+    return {"ok": True, "queued": filename}
+
+
+@app.post("/api/submit-research")
+async def submit_research(
+    x_agent_token: str = Header(...),
+    brand: str = Form(""),
+    model: str = Form(...),
+    category: str = Form(""),
+    chat_id: int = Form(...),
+):
+    """content-factory ставит research-задачу: по наименованию найти фото + УТП.
+    Входного фото НЕТ (input_filename='') — агент ветвится по mode='research'
+    ДО проверки битой задачи. category кладём в specs (промпту нужен тип товара)."""
+    _auth(x_agent_token)
+    with db_conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO jobs (chat_id, input_filename, mode, specs, brand, model) "
+            "VALUES (?, '', 'research', ?, ?, ?)",
+            (chat_id, category or None, brand or None, model),
+        )
+        conn.commit()
+        job_id = cur.lastrowid
+    log.info("submit-research: brand=%s model=%s → job %d", brand, model, job_id)
+    return {"ok": True, "job_id": job_id}
+
+
+@app.post("/api/complete-research/{job_id}")
+async def complete_research(
+    job_id: int,
+    x_agent_token: str = Header(...),
+    utp: str = Form(""),
+    photo: UploadFile | None = File(None),
+):
+    """Агент возвращает результат research: текст УТП + (опционально) фото товара.
+    result_sent=1 сразу — result_sender бота эти задачи не рассылает
+    (их забирает content-factory из queue.db/OUTPUT_DIR)."""
+    _auth(x_agent_token)
+    with db_conn() as conn:
+        row = conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Job not found")
+    out_filename = None
+    if photo is not None:
+        ext = Path(photo.filename or "r.png").suffix.lower() or ".png"
+        out_filename = f"research_{job_id}{ext}"
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        (OUTPUT_DIR / out_filename).write_bytes(await photo.read())
+    with db_conn() as conn:
+        conn.execute(
+            "UPDATE jobs SET status='done', output_filename=?, result_specs=?, "
+            "result_sent=1, updated_at=? WHERE id=?",
+            (out_filename, utp or None, datetime.now().isoformat(), job_id),
+        )
+        conn.commit()
+    log.info("Research %d done: фото=%s, УТП=%d симв.", job_id, out_filename, len(utp or ""))
+    return {"ok": True, "output": out_filename}

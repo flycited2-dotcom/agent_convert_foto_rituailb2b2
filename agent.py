@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -24,6 +25,7 @@ from config import (
     PROCESSED_DIR,
     get_mode,
 )
+from upload_cooldown import is_upload_limit_error
 
 logging.basicConfig(
     level=logging.INFO,
@@ -117,6 +119,12 @@ async def paste_image(page: Page, image_path: Path, settle_seconds: float = 4.0)
     await asyncio.sleep(0.3)
     await page.keyboard.press("Control+V")
     await asyncio.sleep(settle_seconds)
+    # Fail fast, а не молча продолжать с недовложенной картинкой: без этой проверки
+    # агент вставлял бы оставшиеся файлы, жал Submit почти пустым сообщением и получал
+    # от ChatGPT текстовый отказ «не вижу Фото 1-4» вместо явной ошибки (2026-07-03).
+    banner = await _upload_limit_banner_text(page)
+    if banner:
+        raise UploadLimitError(banner.strip()[:200])
 
 
 async def paste_text(page: Page, text: str) -> None:
@@ -130,6 +138,23 @@ async def paste_text(page: Page, text: str) -> None:
     await asyncio.sleep(0.3)
     await page.keyboard.insert_text(text)
     await asyncio.sleep(0.5)
+
+
+class UploadLimitError(RuntimeError):
+    """ChatGPT отказал в загрузке файла — исчерпан лимит ("Максимальное количество
+    загрузок 0 за раз"). Отличаем от обычного таймаута: здесь ретраить в лоб бессмысленно
+    и вредно — квота меньше всего восстановится, если долбить её ретраями (2026-07-03)."""
+
+
+async def _upload_limit_banner_text(page: Page) -> str | None:
+    """Текст красного баннера OpenAI об исчерпанном лимите загрузок, если он сейчас
+    виден на странице, иначе None."""
+    try:
+        text = await page.evaluate(
+            "() => document.body ? document.body.innerText : ''")
+    except Exception:
+        return None
+    return text if is_upload_limit_error(text) else None
 
 
 async def submit(page: Page) -> None:
@@ -149,6 +174,13 @@ async def submit(page: Page) -> None:
         )
         if not is_disabled:
             break
+        if elapsed % 5 == 0:
+            # Fail fast: если ChatGPT уже показал «лимит загрузок», ждать до 120 сек
+            # (а потом ещё 2 повторные попытки в remote_agent.py) бессмысленно —
+            # send-button не разблокируется, пока файл не загрузился.
+            banner = await _upload_limit_banner_text(page)
+            if banner:
+                raise UploadLimitError(banner.strip()[:200])
         if elapsed % 15 == 0:
             log.info("Жду готовности send-button… %d сек", elapsed)
         await asyncio.sleep(1)
@@ -287,6 +319,7 @@ _MODE_FILE_PREFIX = {
     "conditioner": "konditsioner",
     "mcp":         "mbt",
     "kbt":         "kbt",
+    "research":    "research",
 }
 
 # Кириллица → латиница (простой транслит, ГОСТ-подобный)
@@ -352,6 +385,130 @@ def archive_input(file_path: Path) -> Path:
     target = PROCESSED_DIR / f"{ts}_{file_path.name}"
     file_path.rename(target)
     return target
+
+
+# ── research: по наименованию найти УТП + изображение (для контент-завода) ──
+_UTP_LINE = re.compile(r"^\s*(?:[✓✔•\-–—*]|\d+[.)])\s+(.{3,60})\s*$")
+
+
+def parse_utp_lines(text: str | None, max_items: int = 7) -> list[str]:
+    """Строки-УТП из ответа ChatGPT: маркированные (✓ ✔ - – • * цифры) → «✓ …».
+    Дубли и вложенные маркеры («- ✓ …» после сборки <li>) схлопываются."""
+    out = []
+    for line in (text or "").splitlines():
+        m = _UTP_LINE.match(line)
+        if not m:
+            continue
+        body = re.sub(r"^[✓✔•\-–—*\s]+", "", m.group(1)).strip()
+        item = f"✓ {body}"
+        if body and item not in out:
+            out.append(item)
+        if len(out) >= max_items:
+            break
+    return out
+
+
+# Текст ВСЕХ assistant-сообщений: ChatGPT часто отвечает двумя сообщениями
+# (текст с УТП + отдельное сообщение-изображение) — последнее может быть без текста.
+# <li> собираем отдельно с префиксом «- »: маркеры markdown-списков рисуются CSS
+# (::marker) и в innerText НЕ попадают — без префикса парсер УТП их не увидит.
+# Фолбэк: у части ответов assistant-роль в DOM отсутствует (новый рендер/AB) —
+# тогда берём li вне user-сообщений + строки на «✓» из main (наш промпт — плоский
+# текст без li и без строк, начинающихся с «✓», так что он не подмешается).
+ASSISTANT_TEXT_JS = """
+    () => {
+        const asel = '[data-message-author-role="assistant"], [data-author-role="assistant"]';
+        const usel = '[data-message-author-role="user"], [data-author-role="user"]';
+        const out = [];
+        const aMsgs = [...document.querySelectorAll(asel)];
+        if (aMsgs.length) {
+            for (const m of aMsgs) {
+                for (const li of m.querySelectorAll('li')) out.push('- ' + li.innerText);
+                out.push(m.innerText);
+            }
+            return out.join('\\n');
+        }
+        const uMsgs = [...document.querySelectorAll(usel)];
+        const inUser = el => uMsgs.some(m => m.contains(el));
+        for (const li of document.querySelectorAll('main li')) {
+            if (!inUser(li)) out.push('- ' + li.innerText);
+        }
+        const mainEl = document.querySelector('main');
+        if (mainEl) {
+            for (const line of mainEl.innerText.split('\\n')) {
+                if (line.trim().startsWith('✓')) out.push(line.trim());
+            }
+        }
+        return out.join('\\n');
+    }
+"""
+
+
+async def wait_for_utp(page: Page, timeout_sec: int = 270) -> list[str]:
+    """Поллинг ответа до появления стабильного списка УТП (модель с веб-поиском
+    думает 1–3 мин). Готово = ≥3 пунктов и список не меняется два цикла подряд."""
+    utp, stable = [], 0
+    for _ in range(max(1, timeout_sec // 3)):
+        await asyncio.sleep(3)
+        text = await page.evaluate(ASSISTANT_TEXT_JS)
+        cur = parse_utp_lines(text)
+        if len(cur) >= 3:
+            stable = stable + 1 if cur == utp else 0
+            utp = cur
+            if stable >= 2:
+                return utp
+        else:
+            utp, stable = cur, 0
+    return utp if len(utp) >= 3 else []
+
+
+async def process_research(brand: str | None, model: str | None,
+                           category: str | None) -> tuple[Path | None, str]:
+    """Research-задача: без входного фото. ДВА сообщения в одном чате:
+    (1) только список УТП (модели явно запрещаем генерить картинку — иначе она
+    рисует сразу и текст не пишет); (2) изображение товара отдельным запросом.
+    Возвращает (путь к картинке | None, текст УТП). Нет УТП = исключение (ретраи
+    в remote_agent); нет картинки — не ошибка (карточка потом «по названию»)."""
+    from config import RESEARCH_IMAGE_PROMPT
+    cfg = get_mode("research")
+    if cfg.key != "research" or not cfg.is_configured:
+        raise RuntimeError("Режим 'research' не настроен: нет RESEARCH_PROJECT_URL/промпта")
+    product = " ".join(x for x in (category, brand, model) if x).strip()
+    output_path = make_output_path(mode="research", brand=brand, model=model)
+
+    async with async_playwright() as p:
+        browser = await p.chromium.connect_over_cdp(CHROME_CDP_URL)
+        try:
+            page = await find_or_open_chatgpt(browser)
+            await open_new_chat(page, url=cfg.project_url or "https://chatgpt.com/")
+
+            # Шаг 1: только УТП (текст)
+            await paste_text(page, cfg.render_prompt(product))
+            await submit(page)
+            utp = await wait_for_utp(page)
+            if not utp:
+                await _dump_page_state(page, "research_utp")
+                raise RuntimeError("research: в ответе не найден список УТП")
+            log.info("research: %d УТП получено, запрашиваю изображение…", len(utp))
+
+            # Шаг 2: изображение отдельным сообщением (тот же чат)
+            photo: Path | None = None
+            try:
+                await asyncio.sleep(2)
+                await paste_text(page, RESEARCH_IMAGE_PROMPT.replace("{{SPECS}}", product))
+                await submit(page)
+                await asyncio.sleep(5)
+                baseline_srcs = await snapshot_image_srcs(page)
+                await wait_for_generation(page, GENERATION_TIMEOUT_SEC * 1000, baseline_srcs)
+                await download_via_anchor(page, output_path, baseline_srcs)
+                photo = output_path
+            except Exception as e:
+                log.warning("research: изображение не получено (%s) — вернём только УТП", e)
+
+            log.info("research: %d УТП, фото=%s", len(utp), photo.name if photo else "нет")
+            return photo, "\n".join(utp)
+        finally:
+            await browser.close()  # для CDP это disconnect, не убивает Chrome
 
 
 async def process_one_file(

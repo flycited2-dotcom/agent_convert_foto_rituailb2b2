@@ -170,6 +170,8 @@ def init_db() -> None:
             "ALTER TABLE jobs ADD COLUMN specs TEXT",
             "ALTER TABLE jobs ADD COLUMN brand TEXT",
             "ALTER TABLE jobs ADD COLUMN model TEXT",
+            "ALTER TABLE jobs ADD COLUMN caption TEXT",
+            "ALTER TABLE jobs ADD COLUMN result_specs TEXT",
         ):
             try:
                 conn.execute(ddl)
@@ -432,6 +434,8 @@ BTN_RESTART      = "♻️ Рестарт зависших"
 BTN_START_AGENT  = "🚀 Запустить агента"
 BTN_RESTART_AGENT = "🔁 Перезапуск агента"
 BTN_STOP_AGENT   = "⛔ Стоп агента"
+BTN_ONLY_LAPTOP  = "🖥 Только ноут"
+BTN_ONLY_DESKTOP = "🖳 Только десктоп"
 BTN_HIDE         = "🔙 Скрыть меню"
 
 # Reply-клавиатура: режимы / характеристики+статус / действия.
@@ -446,6 +450,7 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
         [KeyboardButton(BTN_CANCEL_LAST), KeyboardButton(BTN_CLEAR)],
         [KeyboardButton(BTN_RESTART), KeyboardButton(BTN_START_AGENT)],
         [KeyboardButton(BTN_RESTART_AGENT), KeyboardButton(BTN_STOP_AGENT)],
+        [KeyboardButton(BTN_ONLY_LAPTOP), KeyboardButton(BTN_ONLY_DESKTOP)],
         [KeyboardButton(BTN_HIDE)],
     ],
     resize_keyboard=True,
@@ -507,14 +512,35 @@ def _agent_hb_age() -> float | None:
     return (datetime.now() - datetime.fromisoformat(row["seen_at"])).total_seconds()
 
 
+# Ключи флагов: общий (старые вотчдоги — десктоп до Task 7) + адресный ноута.
+# Кнопки бота ставят команду ВСЕМ машинам (каждая заберёт свой ключ один раз);
+# адресное управление одной машиной — записью только её ключа (скриптом).
+_AGENT_FLAG_KEYS = ("agent_command", "agent_command_laptop")
+
+
 def _set_agent_flag(command: str) -> None:
-    """Ставит команду для вотчдога на локальном ПК (исполняется один раз)."""
+    """Ставит команду для вотчдогов на локальных ПК (исполняется один раз каждой)."""
     with db_conn() as conn:
         conn.execute("CREATE TABLE IF NOT EXISTS flags (key TEXT PRIMARY KEY, value TEXT)")
-        conn.execute(
-            "INSERT OR REPLACE INTO flags (key, value) VALUES ('agent_command', ?)",
-            (command,),
-        )
+        for key in _AGENT_FLAG_KEYS:
+            conn.execute("INSERT OR REPLACE INTO flags (key, value) VALUES (?, ?)",
+                         (key, command))
+        conn.commit()
+
+
+def _set_exclusive_worker(active: str) -> None:
+    """Ровно одна машина активна: выбранная получает 'start', другая — 'stop'
+    (обе команды в одном атомарном действии, чтобы очередь не грызли обе разом —
+    десктоп со старым кодом лиз не спрашивает, конфликт 2026-07-03/05).
+    active: 'laptop' | 'desktop'."""
+    if active not in ("laptop", "desktop"):
+        raise ValueError(f"неизвестная машина: {active!r} (ожидались laptop/desktop)")
+    with db_conn() as conn:
+        conn.execute("CREATE TABLE IF NOT EXISTS flags (key TEXT PRIMARY KEY, value TEXT)")
+        conn.execute("INSERT OR REPLACE INTO flags (key, value) VALUES (?, ?)",
+                     ("agent_command_laptop", "start" if active == "laptop" else "stop"))
+        conn.execute("INSERT OR REPLACE INTO flags (key, value) VALUES (?, ?)",
+                     ("agent_command", "start" if active == "desktop" else "stop"))
         conn.commit()
 
 
@@ -600,15 +626,17 @@ async def cmd_restart_agent(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def cmd_stop_agent(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Кнопка «⛔ Стоп агента»: вотчдог убьёт remote_agent.py.
-    Фото будут копиться в очереди до следующего запуска."""
+    """Кнопка «⛔ Стоп агента»: вотчдог убьёт remote_agent.py И ботовский Chrome
+    (иначе Chrome с открытым ChatGPT просто висит без дела до следующего "start").
+    Сам вотчдог остаётся живым — иначе Telegram потерял бы возможность запустить
+    обратно дистанционно (некому было бы слушать команду). Фото копятся в очереди."""
     if not update.effective_user or not _allowed(update.effective_user.id):
         return
 
     _set_agent_flag("stop")
     await update.message.reply_text(
         "⛔ Команда на остановку отправлена.\n"
-        "Новые фото будут копиться в очереди.\n"
+        "Агент и Chrome закроются, новые фото будут копиться в очереди.\n"
         f"Запустить снова — кнопкой «{BTN_START_AGENT}».",
         reply_markup=MAIN_KEYBOARD,
     )
@@ -631,6 +659,52 @@ async def cmd_stop_agent(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
             pass
 
     asyncio.create_task(_confirm())
+
+
+async def _cmd_exclusive_worker(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
+                                active: str, label: str) -> None:
+    """Общая реализация кнопок «Только ноут»/«Только десктоп»: ровно одна
+    машина остаётся активной (_set_exclusive_worker), другая получает stop —
+    иначе обе продолжают грызть очередь параллельно (десктоп со старым кодом
+    лиз не спрашивает, конфликт 2026-07-03/05)."""
+    if not update.effective_user or not _allowed(update.effective_user.id):
+        return
+
+    _set_exclusive_worker(active)
+    await update.message.reply_text(
+        f"🔀 Команда отправлена: активен только {label}, вторая машина — стоп.\n"
+        "Вотчдоги подхватят в течение ~15 сек.\n"
+        "⚠️ Heartbeat в базе общий на обе машины — подтверждение ниже покажет "
+        "только «есть ли связь хоть с кем-то», не «именно с нужной машиной».",
+        reply_markup=MAIN_KEYBOARD,
+    )
+
+    chat_id = update.effective_chat.id
+
+    async def _confirm() -> None:
+        await asyncio.sleep(120)
+        age2 = _agent_hb_age()
+        ok = age2 is not None and age2 < 60
+        try:
+            if ok:
+                await ctx.bot.send_message(chat_id, f"✅ Связь есть (ожидаем {label}).")
+            else:
+                await ctx.bot.send_message(
+                    chat_id, f"❌ Никто не на связи — проверь вотчдог на {label}.")
+        except Exception:
+            pass
+
+    asyncio.create_task(_confirm())
+
+
+async def cmd_only_laptop(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Кнопка «🖥 Только ноут»: ноут — start, десктоп — stop."""
+    await _cmd_exclusive_worker(update, ctx, "laptop", "ноут")
+
+
+async def cmd_only_desktop(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Кнопка «🖳 Только десктоп»: десктоп — start, ноут — stop."""
+    await _cmd_exclusive_worker(update, ctx, "desktop", "десктоп")
 
 
 async def cmd_last(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
@@ -960,6 +1034,10 @@ async def on_keyboard_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> No
         await cmd_restart_agent(update, ctx)
     elif text == BTN_STOP_AGENT:
         await cmd_stop_agent(update, ctx)
+    elif text == BTN_ONLY_LAPTOP:
+        await cmd_only_laptop(update, ctx)
+    elif text == BTN_ONLY_DESKTOP:
+        await cmd_only_desktop(update, ctx)
     elif text == BTN_SPECS:
         await cmd_request_specs(update, ctx)
     elif text == BTN_HIDE:
@@ -1067,7 +1145,7 @@ async def handle_photo(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
 
-async def on_callback(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
     if not q or not update.effective_user or not _allowed(update.effective_user.id):
         if q:
@@ -1098,6 +1176,43 @@ async def on_callback(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         await q.message.reply_text(f"Задача #{job_id} не найдена в БД.", reply_markup=MAIN_KEYBOARD)
         return
 
+    if action == "publish":
+        # Владелец подтвердил публикацию готовой карточки (режим подтверждения).
+        job_mode = row["mode"] if "mode" in row.keys() else DEFAULT_MODE
+        channel_id = MODES_CHANNELS.get(job_mode, "")
+        if not channel_id:
+            await q.message.reply_text(
+                f"⚠️ Канал для режима «{MODES_LABELS.get(job_mode, job_mode)}» не настроен.\n"
+                "Добавьте в .env VPS переменную <MODE>_TELEGRAM_CHANNEL_ID.",
+                reply_markup=MAIN_KEYBOARD,
+            )
+            return
+        out_name = row["output_filename"]
+        if not out_name:
+            await q.message.reply_text("⚠️ У этой задачи нет output_filename.", reply_markup=MAIN_KEYBOARD)
+            return
+        out_path = OUTPUT_DIR / out_name
+        if not out_path.exists():
+            await q.message.reply_text(f"⚠️ Файл результата не найден: {out_name}", reply_markup=MAIN_KEYBOARD)
+            return
+        # Подпись-прайс из Stock Bot (HTML-цитата). В канал постим КАК ФОТО с подписью
+        # (не файл-вложение). Без подписи — просто фото.
+        stored_caption = row["caption"] if "caption" in row.keys() else None
+        try:
+            with open(out_path, "rb") as f:
+                await context.bot.send_photo(
+                    chat_id=int(channel_id),
+                    photo=InputFile(f, filename=out_name),
+                    caption=stored_caption or None,
+                    parse_mode=("HTML" if stored_caption else None),
+                    read_timeout=120, write_timeout=120, connect_timeout=30,
+                )
+            await q.message.reply_text(f"✅ Опубликовано в канал!\n{out_name}", reply_markup=MAIN_KEYBOARD)
+            log.info("publish: канал %s ← %s", channel_id, out_name)
+        except Exception as e:
+            await q.message.reply_text(f"❌ Ошибка публикации: {e}", reply_markup=MAIN_KEYBOARD)
+        return
+
     if action == "redo":
         archived_name = row["archived_filename"]
         if not archived_name:
@@ -1114,10 +1229,10 @@ async def on_callback(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         shutil.copyfile(src, INPUT_DIR / new_filename)
         with db_conn() as conn:
             conn.execute(
-                "INSERT INTO jobs (chat_id, input_filename, mode, specs, brand, model) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO jobs (chat_id, input_filename, mode, specs, brand, model, caption) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (q.message.chat_id, new_filename,
-                 row["mode"], row["specs"], row["brand"], row["model"]),
+                 row["mode"], row["specs"], row["brand"], row["model"], row["caption"]),
             )
             conn.commit()
         await q.message.reply_text(
@@ -1142,10 +1257,10 @@ async def on_callback(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         shutil.copyfile(src, INPUT_DIR / new_filename)
         with db_conn() as conn:
             conn.execute(
-                "INSERT INTO jobs (chat_id, input_filename, mode, specs, brand, model) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO jobs (chat_id, input_filename, mode, specs, brand, model, caption) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (q.message.chat_id, new_filename,
-                 row["mode"], row["specs"], row["brand"], row["model"]),
+                 row["mode"], row["specs"], row["brand"], row["model"], row["caption"]),
             )
             conn.commit()
         await q.message.reply_text(
@@ -1274,17 +1389,33 @@ async def _auto_housekeeping(app: Application) -> None:
             log.warning("Housekeeping ошибка: %s", e)
 
 
+def _conditioner_result_markup(job_id: int, has_channel: bool) -> InlineKeyboardMarkup:
+    """Кнопки под готовой карточкой кондиционера (режим подтверждения).
+    «Опубликовать» показываем только если канал настроен."""
+    rows = []
+    if has_channel:
+        rows.append([InlineKeyboardButton("✅ Опубликовать в канал",
+                                          callback_data=f"publish:{job_id}")])
+    rows.append([InlineKeyboardButton("🔄 Перегенерировать", callback_data=f"redo:{job_id}")])
+    rows.append([InlineKeyboardButton("🗑 Удалить (плохой)", callback_data=f"bad:{job_id}")])
+    return InlineKeyboardMarkup(rows)
+
+
 async def result_sender(app: Application) -> None:
     log.info("Result sender запущен")
     while True:
         await asyncio.sleep(5)
         try:
             with db_conn() as conn:
+                # research-задачи (фото+УТП для контент-завода) рассылать не надо:
+                # их результат и ошибки забирает/алертит content-factory сам.
                 done_rows   = conn.execute(
-                    "SELECT * FROM jobs WHERE status='done'   AND result_sent=0 ORDER BY id"
+                    "SELECT * FROM jobs WHERE status='done'   AND result_sent=0 "
+                    "AND mode != 'research' ORDER BY id"
                 ).fetchall()
                 failed_rows = conn.execute(
-                    "SELECT * FROM jobs WHERE status='failed' AND result_sent=0 ORDER BY id"
+                    "SELECT * FROM jobs WHERE status='failed' AND result_sent=0 "
+                    "AND mode != 'research' ORDER BY id"
                 ).fetchall()
 
             for row in done_rows:
@@ -1301,7 +1432,33 @@ async def result_sender(app: Application) -> None:
                     mode_label = MODES_LABELS.get(job_mode, job_mode)
                     channel_id = MODES_CHANNELS.get(job_mode, "")
 
-                    if channel_id:
+                    if job_mode == "conditioner":
+                        # Режим подтверждения: НЕ постим в канал сразу — карточку
+                        # шлём владельцу с кнопками [✅ Опубликовать] [🔄] [🗑].
+                        # Превью = ТА ЖЕ подпись-прайс, что уйдёт в канал (видно до публикации).
+                        stored_caption = row["caption"] if "caption" in row.keys() else None
+                        if stored_caption:
+                            preview, pmode = stored_caption, "HTML"
+                        else:
+                            pending_now = _pending_count()
+                            preview = (
+                                f"✅ Готово ({mode_label}): {row['output_filename']}\n"
+                                f"В очереди: {pending_now}"
+                            )
+                            pmode = None
+                        if not channel_id:
+                            preview += "\n⚠️ Канал не настроен — кнопки «Опубликовать» нет."
+                        with open(out_path, "rb") as f:
+                            await app.bot.send_document(
+                                chat_id=row["chat_id"],
+                                document=InputFile(f, filename=row["output_filename"]),
+                                caption=preview,
+                                parse_mode=pmode,
+                                reply_markup=_conditioner_result_markup(row["id"], bool(channel_id)),
+                                read_timeout=120, write_timeout=120, connect_timeout=30,
+                            )
+                        log.info("Карточка → владелец (подтверждение): %s", row["output_filename"])
+                    elif channel_id:
                         # Отправляем только в канал режима — без дублирования в личный чат.
                         # Большие файлы (5-6 МБ) требуют увеличенных таймаутов, иначе
                         # send_document падает с "Timed out".
@@ -1479,7 +1636,7 @@ def main() -> None:
 
     # Reply-клавиатура шлёт обычный текст — ловим точные совпадения с подписями кнопок
     import re
-    button_labels = list(MODES_LABELS.values()) + [BTN_SPECS, BTN_STATUS, BTN_CANCEL_LAST, BTN_CLEAR, BTN_RESTART, BTN_START_AGENT, BTN_RESTART_AGENT, BTN_STOP_AGENT, BTN_HIDE]
+    button_labels = list(MODES_LABELS.values()) + [BTN_SPECS, BTN_STATUS, BTN_CANCEL_LAST, BTN_CLEAR, BTN_RESTART, BTN_START_AGENT, BTN_RESTART_AGENT, BTN_STOP_AGENT, BTN_ONLY_LAPTOP, BTN_ONLY_DESKTOP, BTN_HIDE]
     pattern = "^(" + "|".join(re.escape(b) for b in button_labels) + ")$"
     app.add_handler(MessageHandler(
         filters.TEXT & filters.Regex(pattern),

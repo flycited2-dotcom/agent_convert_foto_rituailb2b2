@@ -307,3 +307,37 @@ VPS работает нестабильно — заливать файлы че
 В пользовательском глобальном `~/.claude/CLAUDE.md` стоит правило: всегда
 применять `karpathy-guidelines` skill (думать перед кодом, simplicity first,
 surgical changes, goal-driven execution). Это применяется автоматически.
+
+## Failover двух генераторов (десктоп + ноутбук, 2026-06-30)
+
+Из-за перебоев с электричеством десктоп («контент-машина») часто выключен.
+Добавлен **второй генератор — ноутбук** с авто-failover и приоритетом десктопа.
+Спек/план: `docs/superpowers/specs/2026-06-26-dual-worker-failover-design.md`,
+`docs/superpowers/plans/2026-06-30-dual-worker-failover.md`. Ветка
+`claude/conditioner-approval-pipeline` (запушена).
+
+**Как устроено:**
+- VPS API: `POST /api/worker/lease` (worker_id, priority) + таблица `workers`.
+  Активен среди свежих (seen_at ≤ `LEASE_TTL_SECONDS`=900) тот, у кого
+  наименьший priority. Чистая логика — `worker_lease.py::active_worker_id`.
+- Агент (`remote_agent.py`): перед `/api/next-job` зовёт `claim_lease`
+  (`worker_lease_client.py`); `active=false` → standby, задачи не берёт.
+  Гейт включается только при заданном `WORKER_ID` (без него — active=true,
+  обратная совместимость).
+- `.env`: `WORKER_ID` + `WORKER_PRIORITY`. Десктоп=1, ноут=2.
+
+**Состояние на 2026-06-30:**
+- ✅ VPS-слой развёрнут и проверен (`/root/ritualb2b/vps_api.py` +
+  `worker_lease.py`, restart api). Бэкапы `queue.db.bak-*`, `vps_api.py.bak-*`.
+- ✅ Ноутбук: `.env` (WORKER_ID=laptop, prio=2, VPS_SSH_KEY=`id_ritualb2b_claude`),
+  агент работает, лиз в проде ОК. WatchDog в Планировщике задача
+  **`RitualB2B_Watchdog_Laptop`** (отдельное имя от десктопного, триггеры
+  5мин+logon, ExecutionTimeLimit=0, NextRunTime непустой) — постоянный.
+- ⏳ **Десктоп — НЕ обновлён** (был выключен). Когда включат: `git pull`
+  (эта ветка) → в `.env` добавить `WORKER_ID=desktop`,`WORKER_PRIORITY=1` →
+  перезапустить агента. ⚠️ ДО этого не запускать оба одновременно: старый
+  десктоп-агент лиз не спрашивает → будет конфликт с ноутом. Кнопка «⛔ Стоп
+  агента» в боте сейчас управляет ноутом (он единственный поллит команды).
+- Грабли env-питона на ноуте: для задачи Планировщика использовать ЯВНЫЙ
+  `C:\Users\user\AppData\Local\Python\pythoncore-3.14-64\pythonw.exe`
+  (а не WindowsApps-алиас).

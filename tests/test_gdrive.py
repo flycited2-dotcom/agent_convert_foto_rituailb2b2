@@ -118,7 +118,8 @@ def test_real_upload_and_delete(tmp_path):
 # ══════════════════════════════════════════════════════════════════════
 
 def test_all_modes_have_gdrive_folder_id():
-    """Все 5 режимов имеют GDRIVE_FOLDER_ID из .env."""
+    """Все карточные режимы имеют GDRIVE_FOLDER_ID из .env.
+    research — не карточный (его результат забирает content-factory, GDrive не нужен)."""
     from dotenv import load_dotenv
     env_path = _AGENT_DIR / ".env"
     if not env_path.exists():
@@ -130,7 +131,8 @@ def test_all_modes_have_gdrive_folder_id():
     importlib.reload(config)
 
     modes = config.MODES  # dict[str, Mode]
-    missing = [key for key, m in modes.items() if not m.gdrive_folder_id]
+    missing = [key for key, m in modes.items()
+               if not m.gdrive_folder_id and key != "research"]
     assert not missing, (
         f"Режимы без GDRIVE_FOLDER_ID: {missing}\n"
         "Проверь .env — должны быть RITUAL_GDRIVE_FOLDER_ID, WREATH_GDRIVE_FOLDER_ID и т.д."
