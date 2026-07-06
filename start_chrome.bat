@@ -1,11 +1,8 @@
 @echo off
-REM Запуск отдельного Chrome для агента (отдельный профиль, режим CDP)
-REM Этот Chrome НЕ мешает твоему обычному Chrome
-REM
-REM Параметры (мульти-аккаунт, Phase 2): %1 = CDP-порт, %2 = имя папки профиля.
-REM Без параметров — как раньше (порт 9333, профиль chrome_profile).
-REM Вторая дорожка (аккаунт 2): start_chrome.bat 9334 chrome_profile_acc2
-REM   → в открывшемся Chrome один раз войти в ChatGPT-аккаунт 2.
+REM Chrome dlya agenta (otdelnyj profil, CDP). Ne meshaet lichnomu Chrome.
+REM Parametry (multi-account, Phase 2): %1 = CDP-port, %2 = imya papki profilya.
+REM Bez parametrov - kak ranshe (9333 / chrome_profile).
+REM Vtoroj akkaunt: start_chrome.bat 9334 chrome_profile_acc2 -> vojti v ChatGPT acc2.
 
 set CHROME="C:\Program Files\Google\Chrome\Application\chrome.exe"
 set DEBUG_PORT=%~1
@@ -15,14 +12,9 @@ if "%PROFILE_NAME%"=="" set PROFILE_NAME=chrome_profile
 set PROFILE_DIR=%~dp0%PROFILE_NAME%
 
 echo ============================================================
-echo  Запуск Chrome для агента обработки фото
-echo  Порт отладки: %DEBUG_PORT%
-echo  Профиль: %PROFILE_DIR%
+echo  Chrome dlya agenta: port %DEBUG_PORT%, profil %PROFILE_DIR%
 echo ============================================================
-echo.
-echo Если открывается впервые — войди в свой ChatGPT (Plus аккаунт).
-echo Сессия сохранится. В следующий раз логиниться не нужно.
-echo.
+echo Esli profil novyj - vojdi v ChatGPT, sessiya sohranitsya.
 
 start "" %CHROME% ^
     --remote-debugging-port=%DEBUG_PORT% ^
@@ -32,5 +24,5 @@ start "" %CHROME% ^
     --disable-features=TranslateUI ^
     https://chatgpt.com/
 
-echo Chrome запущен. Можно закрыть это окно.
+echo Chrome zapushchen.
 timeout /t 3 >nul

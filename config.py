@@ -242,6 +242,10 @@ class Lane:
     # на разных машинах не работают параллельно (failover-лиз workers), разных —
     # работают. Пусто в json → id дорожки (ни с кем не связана).
     account: str = ""
+    # Allowlist режимов дорожки (напр. ["mcp","kbt","research"]): у акк2 нет
+    # проектов всех режимов — чужой mode открыл бы acc1-проект в acc2-сессии.
+    # Пусто → все режимы (дорожка полного аккаунта).
+    modes: list | None = None
 
     @property
     def cdp_url(self) -> str:
@@ -287,7 +291,8 @@ def load_lanes(path: Path | None = None) -> list[Lane]:
                  profile_dir=l.get("profile_dir", "chrome_profile"),
                  enabled=bool(l.get("enabled", True)),
                  project_urls=l.get("project_urls") or {},
-                 account=(l.get("account") or l["id"]))
+                 account=(l.get("account") or l["id"]),
+                 modes=l.get("modes") or [])
             for l in _lanes_raw(path).get("lanes", [])]
 
 

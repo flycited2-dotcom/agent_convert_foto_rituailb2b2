@@ -133,6 +133,28 @@ class AtomicClaimTest(unittest.TestCase):
         r = self._next(caps="research")
         self.assertEqual(r.status_code, 200)                        # умеющий research
 
+    # ── modes-фильтр дорожки: acc2 без ritual-проекта не берёт ritual ────────
+    def test_modes_allowlist_limits_claims(self):
+        con = sqlite3.connect(self.db)
+        con.execute("INSERT INTO jobs (input_filename, status, mode) VALUES "
+                    "('r.png','pending','ritual')")
+        con.execute("INSERT INTO jobs (input_filename, status, mode) VALUES "
+                    "('m.png','pending','mcp')")
+        con.commit()
+        con.close()
+        r = self.client.get("/api/next-job", headers={"x-agent-token": "T"},
+                            params={"modes": "mcp,kbt"})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["mode"], "mcp")           # ritual пропущен
+        r2 = self.client.get("/api/next-job", headers={"x-agent-token": "T"},
+                             params={"modes": "mcp,kbt"})
+        self.assertEqual(r2.status_code, 204)               # ritual так и не отдан
+
+    def test_modes_empty_means_all(self):
+        self._seed(1, mode="ritual")
+        r = self._next()                                    # без modes — как раньше
+        self.assertEqual(r.status_code, 200)
+
     # ── аренда (lease) ───────────────────────────────────────────────────────
     def test_stale_processing_requeued_and_reclaimed(self):
         (jid,) = self._seed(1, status="processing")

@@ -169,10 +169,13 @@ async def agent_loop(api_url: str) -> None:
                     continue
 
                 # --- Получаем следующую задачу (caps: этот агент умеет research;
-                # lane уходит в claimed_by — видно, кто держит задачу) ---
+                # lane уходит в claimed_by; modes — allowlist режимов дорожки:
+                # чужой mode открыл бы не тот проект/аккаунт) ---
+                _params = {"caps": "research", "lane": LANE_ID or WORKER_ID}
+                if LANE and LANE.modes:
+                    _params["modes"] = ",".join(LANE.modes)
                 r = await client.get(f"{api_url}/api/next-job", headers=headers,
-                                     params={"caps": "research",
-                                             "lane": LANE_ID or WORKER_ID})
+                                     params=_params)
                 net_errors = 0  # связь жива
                 if r.status_code == 204:
                     await asyncio.sleep(POLL_INTERVAL)

@@ -75,15 +75,24 @@ def _ensure_claim_columns(conn: sqlite3.Connection) -> None:
 # ---------------------------------------------------------------------------
 
 @app.get("/api/next-job")
-def next_job(x_agent_token: str = Header(...), caps: str = "", lane: str = ""):
+def next_job(x_agent_token: str = Header(...), caps: str = "", lane: str = "",
+             modes: str = ""):
     _auth(x_agent_token)
     # caps — возможности агента (напр. "research"). Старые агенты параметр не шлют —
     # research-задачи им НЕ отдаём (не умеют и фейлили бы их «битой задачей»);
     # обычные карточки отдаём всем, как раньше.
     # lane — id дорожки (мульти-аккаунт, Phase 1): пишется в claimed_by.
+    # modes — allowlist режимов дорожки (напр. "mcp,kbt,research"): у акк2 нет
+    # проектов всех режимов — чужой mode открыл бы acc1-проект в acc2-сессии
+    # и падал. Пусто = все режимы (как раньше).
     where = "status='pending'"
+    args: list = []
     if "research" not in (caps or "").split(","):
         where += " AND mode != 'research'"
+    allow = [m.strip() for m in (modes or "").split(",") if m.strip()]
+    if allow:
+        where += f" AND mode IN ({','.join('?' * len(allow))})"
+        args = allow
     now = datetime.now()
     with db_conn() as conn:
         _ensure_claim_columns(conn)
@@ -102,7 +111,7 @@ def next_job(x_agent_token: str = Header(...), caps: str = "", lane: str = ""):
             f"UPDATE jobs SET status='processing', claimed_by=?, claimed_at=?, "
             f"updated_at=? WHERE id=(SELECT id FROM jobs WHERE {where} "
             f"ORDER BY id LIMIT 1) RETURNING *",
-            (lane or None, now.isoformat(), now.isoformat())).fetchone()
+            (lane or None, now.isoformat(), now.isoformat(), *args)).fetchone()
         conn.commit()
     if not row:
         return JSONResponse(status_code=204, content=None)
