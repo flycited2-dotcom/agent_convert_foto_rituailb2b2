@@ -1,0 +1,37 @@
+{
+  "_comment": "Дорожки ChatGPT (lane = профиль Chrome + порт + аккаунт). machines: MachineGuid → имя (см. content-factory config/machines.yaml). Каждая машина поднимает ТОЛЬКО свои enabled-дорожки. project_urls: override на режим — литеральный URL или 'env:ИМЯ' (сам URL держать в .env). Вторую дорожку включать ПОСЛЕ логина в её Chrome-профиль: start_chrome.bat 9334 chrome_profile_acc2",
+  "machines": {
+    "f91c394d-3440-40c5-994c-227743f224c6": "laptop",
+    "4557e2b1-f540-4dc1-a4db-f733c096ab11": "desktop"
+  },
+  "lanes": [
+    {
+      "id": "laptop-a1",
+      "machine": "laptop",
+      "cdp_port": 9333,
+      "profile_dir": "chrome_profile",
+      "enabled": true,
+      "project_urls": {}
+    },
+    {
+      "id": "laptop-a2",
+      "machine": "laptop",
+      "cdp_port": 9334,
+      "profile_dir": "chrome_profile_acc2",
+      "enabled": false,
+      "project_urls": {
+        "mcp": "env:MCP_PROJECT_URL_ACC2",
+        "kbt": "env:KBT_PROJECT_URL_ACC2",
+        "research": "env:RESEARCH_PROJECT_URL_ACC2"
+      }
+    },
+    {
+      "id": "desktop-a1",
+      "machine": "desktop",
+      "cdp_port": 9333,
+      "profile_dir": "chrome_profile",
+      "enabled": true,
+      "project_urls": {}
+    }
+  ]
+}

@@ -463,12 +463,15 @@ async def wait_for_utp(page: Page, timeout_sec: int = 270) -> list[str]:
 
 
 async def process_research(brand: str | None, model: str | None,
-                           category: str | None) -> tuple[Path | None, str]:
+                           category: str | None,
+                           cdp_url: str | None = None,
+                           project_url: str | None = None) -> tuple[Path | None, str]:
     """Research-задача: без входного фото. ДВА сообщения в одном чате:
     (1) только список УТП (модели явно запрещаем генерить картинку — иначе она
     рисует сразу и текст не пишет); (2) изображение товара отдельным запросом.
     Возвращает (путь к картинке | None, текст УТП). Нет УТП = исключение (ретраи
-    в remote_agent); нет картинки — не ошибка (карточка потом «по названию»)."""
+    в remote_agent); нет картинки — не ошибка (карточка потом «по названию»).
+    cdp_url/project_url — переопределения от дорожки (None = как раньше)."""
     from config import RESEARCH_IMAGE_PROMPT
     cfg = get_mode("research")
     if cfg.key != "research" or not cfg.is_configured:
@@ -477,10 +480,11 @@ async def process_research(brand: str | None, model: str | None,
     output_path = make_output_path(mode="research", brand=brand, model=model)
 
     async with async_playwright() as p:
-        browser = await p.chromium.connect_over_cdp(CHROME_CDP_URL)
+        browser = await p.chromium.connect_over_cdp(cdp_url or CHROME_CDP_URL)
         try:
             page = await find_or_open_chatgpt(browser)
-            await open_new_chat(page, url=cfg.project_url or "https://chatgpt.com/")
+            await open_new_chat(page, url=project_url or cfg.project_url
+                                or "https://chatgpt.com/")
 
             # Шаг 1: только УТП (текст)
             await paste_text(page, cfg.render_prompt(product))
@@ -517,7 +521,11 @@ async def process_one_file(
     specs: str | None = None,
     brand: str | None = None,
     model: str | None = None,
+    cdp_url: str | None = None,
+    project_url: str | None = None,
 ) -> Path:
+    # cdp_url/project_url — переопределения от дорожки (lanes, Phase 3):
+    # None = модульные значения, поведение как раньше (одна дорожка).
     cfg = get_mode(mode)
     if not cfg.is_configured:
         raise RuntimeError(
@@ -528,7 +536,7 @@ async def process_one_file(
 
     rendered_prompt = cfg.render_prompt(specs)
     output_path = make_output_path(mode=cfg.key, brand=brand, model=model)
-    chat_url = cfg.project_url or "https://chatgpt.com/"
+    chat_url = project_url or cfg.project_url or "https://chatgpt.com/"
     log.info(
         "=== Обработка: %s → %s (mode: %s, brand=%s, model=%s, specs: %d симв.) ===",
         file_path.name, output_path.name, cfg.key,
@@ -536,7 +544,7 @@ async def process_one_file(
     )
 
     async with async_playwright() as p:
-        browser = await p.chromium.connect_over_cdp(CHROME_CDP_URL)
+        browser = await p.chromium.connect_over_cdp(cdp_url or CHROME_CDP_URL)
         try:
             page = await find_or_open_chatgpt(browser)
             await open_new_chat(page, url=chat_url)

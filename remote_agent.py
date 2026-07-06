@@ -22,22 +22,33 @@ load_dotenv(ROOT / ".env")
 
 from datetime import datetime, timedelta  # noqa: E402
 
+# Дорожка (lane, Phase 3 мульти-аккаунта): LANE_ID из env/CLI → свой CDP-порт,
+# per-mode project_url и отдельный лог. Без LANE_ID — поведение как раньше.
+LANE_ID = (sys.argv[1] if len(sys.argv) > 1 else os.getenv("LANE_ID", "")).strip()
+
 # Логирование настраиваем ДО импорта agent.py — иначе agent.basicConfig
 # перехватит все логи в agent.log. force=True перебивает любой предыдущий конфиг.
 _LOGS_DIR = ROOT / os.getenv("LOGS_DIR", "logs")
 _LOGS_DIR.mkdir(parents=True, exist_ok=True)
+_LOG_NAME = f"remote_agent_{LANE_ID}.log" if LANE_ID else "remote_agent.log"
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[
-        logging.FileHandler(_LOGS_DIR / "remote_agent.log", encoding="utf-8"),
+        logging.FileHandler(_LOGS_DIR / _LOG_NAME, encoding="utf-8"),
         logging.StreamHandler(),
     ],
     force=True,
 )
 log = logging.getLogger("remote_agent")
 
-from config import CHROME_CDP_URL, DELAY_BETWEEN_JOBS_SEC, GDRIVE_CREDENTIALS_JSON, GDRIVE_FOLDER_ID, get_mode  # noqa: E402
+from config import CHROME_CDP_URL, DELAY_BETWEEN_JOBS_SEC, GDRIVE_CREDENTIALS_JSON, GDRIVE_FOLDER_ID, get_lane, get_mode  # noqa: E402
+
+LANE = get_lane(LANE_ID) if LANE_ID else None
+if LANE_ID and LANE is None:
+    raise SystemExit(f"LANE_ID={LANE_ID!r} не найден в lanes.json — проверь id дорожки")
+# CDP своей дорожки; без дорожки — модульный (одноканальный режим, как раньше)
+CDP_URL = LANE.cdp_url if LANE else CHROME_CDP_URL
 from agent import UploadLimitError, process_one_file, process_research  # noqa: E402
 from ssh_tunnel import SSHTunnel  # noqa: E402
 from worker_lease_client import claim_lease  # noqa: E402
@@ -113,8 +124,10 @@ async def agent_loop(api_url: str) -> None:
                     # сетевые ошибки уходят в общий обработчик ниже — файл остаётся в списке
 
                 # Heartbeat — VPS фиксирует время последнего контакта агента
+                # (+ per-lane строка, если дорожка задана)
                 try:
-                    await client.post(f"{api_url}/api/heartbeat", headers=headers)
+                    await client.post(f"{api_url}/api/heartbeat", headers=headers,
+                                      params={"lane": LANE_ID} if LANE_ID else None)
                 except Exception:
                     pass
 
@@ -142,16 +155,18 @@ async def agent_loop(api_url: str) -> None:
                 # ECONNREFUSED за 3 быстрые попытки (грабля 2026-06-12).
                 # Поднять Chrome может вотчдог (кнопка «Запустить» в Telegram).
                 try:
-                    await client.get(f"{CHROME_CDP_URL}/json/version", timeout=3)
+                    await client.get(f"{CDP_URL}/json/version", timeout=3)
                 except Exception:
                     log.warning("Chrome CDP не отвечает (%s) — задачи не беру, "
-                                "жду 30 сек.", CHROME_CDP_URL)
+                                "жду 30 сек.", CDP_URL)
                     await asyncio.sleep(30)
                     continue
 
-                # --- Получаем следующую задачу (caps: этот агент умеет research) ---
+                # --- Получаем следующую задачу (caps: этот агент умеет research;
+                # lane уходит в claimed_by — видно, кто держит задачу) ---
                 r = await client.get(f"{api_url}/api/next-job", headers=headers,
-                                     params={"caps": "research"})
+                                     params={"caps": "research",
+                                             "lane": LANE_ID or WORKER_ID})
                 net_errors = 0  # связь жива
                 if r.status_code == 204:
                     await asyncio.sleep(POLL_INTERVAL)
@@ -182,7 +197,10 @@ async def agent_loop(api_url: str) -> None:
                                 # «слишком много запросов» 2026-07-02)
                                 await asyncio.sleep(60)
                             photo, utp = await process_research(
-                                job_brand, job_model, job_specs)
+                                job_brand, job_model, job_specs,
+                                cdp_url=CDP_URL,
+                                project_url=(LANE.project_url_for("research")
+                                             if LANE else None) or None)
                             files = None
                             if photo and photo.exists():
                                 files = {"photo": (photo.name, photo.read_bytes(),
@@ -243,6 +261,9 @@ async def agent_loop(api_url: str) -> None:
                             output_path = await process_one_file(
                                 tmp_input, mode=job_mode, specs=job_specs,
                                 brand=job_brand, model=job_model,
+                                cdp_url=CDP_URL,
+                                project_url=(LANE.project_url_for(job_mode)
+                                             if LANE else None) or None,
                             )
                             log.info("Обработано → %s", output_path)
                             last_error = None

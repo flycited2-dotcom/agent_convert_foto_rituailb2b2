@@ -260,8 +260,11 @@ def worker_lease(
 
 
 @app.post("/api/heartbeat")
-def agent_heartbeat(x_agent_token: str = Header(...)):
-    """Агент вызывает при каждом цикле опроса — фиксируем время последнего контакта."""
+def agent_heartbeat(x_agent_token: str = Header(...), lane: str = ""):
+    """Агент вызывает при каждом цикле опроса — фиксируем время последнего контакта.
+    lane — id дорожки (Phase 3): пишем и общую строку (id=1, её читает статус
+    vps_bot — совместимость), и per-lane строку в НОВУЮ таблицу lane_heartbeat
+    (PK у agent_heartbeat не альтерится — SQLite не умеет менять PK)."""
     _auth(x_agent_token)
     with db_conn() as conn:
         conn.execute(
@@ -269,6 +272,14 @@ def agent_heartbeat(x_agent_token: str = Header(...)):
             "ON CONFLICT(id) DO UPDATE SET seen_at=excluded.seen_at",
             (datetime.now().isoformat(),),
         )
+        conn.execute("CREATE TABLE IF NOT EXISTS lane_heartbeat "
+                     "(lane TEXT PRIMARY KEY, seen_at TEXT)")
+        if lane:
+            conn.execute(
+                "INSERT INTO lane_heartbeat (lane, seen_at) VALUES (?, ?) "
+                "ON CONFLICT(lane) DO UPDATE SET seen_at=excluded.seen_at",
+                (lane, datetime.now().isoformat()),
+            )
         conn.commit()
     return {"ok": True}
 

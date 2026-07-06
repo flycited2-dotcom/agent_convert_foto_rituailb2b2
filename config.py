@@ -218,3 +218,83 @@ CHATGPT_PROJECT_URL = MODES[DEFAULT_MODE].project_url
 PROMPT_TEMPLATE     = MODES[DEFAULT_MODE].prompt
 REFERENCE_FILES     = MODES[DEFAULT_MODE].reference_files
 TZ_FILE             = REFERENCE_DIR / "tz.txt"
+
+
+# ---------------------------------------------------------------------------
+# Дорожки (lanes) — мульти-аккаунт ChatGPT (Phase 3 спеки 2026-07-06).
+# lanes.json: карта машин (MachineGuid → имя) + дорожки с ПРИВЯЗКОЙ к машине.
+# my_lanes() отдаёт только дорожки своей машины — иначе оба вотчдога подняли бы
+# все дорожки и задвоили аккаунты (ревью 2026-07-06). project_url на дорожку —
+# литералом или "env:ИМЯ" (URL остаётся в .env, lanes.json — в git).
+# ---------------------------------------------------------------------------
+LANES_FILE = ROOT / "lanes.json"
+
+
+@dataclass
+class Lane:
+    id: str
+    machine: str
+    cdp_port: int
+    profile_dir: str = "chrome_profile"
+    enabled: bool = True
+    project_urls: dict | None = None
+
+    @property
+    def cdp_url(self) -> str:
+        return f"http://127.0.0.1:{self.cdp_port}"
+
+    def project_url_for(self, mode_key: str) -> str:
+        """Переопределение project_url дорожки для режима: литеральный URL или
+        'env:ИМЯ' (значение из .env). Пусто → '' — вызывающий падает обратно
+        на Mode.project_url (дорожка акк1 живёт на текущих env-переменных)."""
+        raw = ((self.project_urls or {}).get(mode_key) or "").strip()
+        if raw.startswith("env:"):
+            return os.getenv(raw[4:], "").strip()
+        return raw
+
+
+def machine_id() -> str:
+    """Идентичность машины: env LANE_MACHINE_GUID (тесты/не-Windows) или
+    Windows MachineGuid (стабилен, не меняется при переименовании ПК)."""
+    env = os.getenv("LANE_MACHINE_GUID", "").strip()
+    if env:
+        return env
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                            r"SOFTWARE\Microsoft\Cryptography") as k:
+            return str(winreg.QueryValueEx(k, "MachineGuid")[0])
+    except (OSError, ImportError):
+        return ""
+
+
+def _lanes_raw(path: Path | None = None) -> dict:
+    import json
+    p = path or LANES_FILE
+    if not Path(p).exists():
+        return {}
+    return json.loads(Path(p).read_text(encoding="utf-8"))
+
+
+def load_lanes(path: Path | None = None) -> list[Lane]:
+    """Все дорожки из lanes.json (нет файла → пусто = поведение как раньше)."""
+    return [Lane(id=l["id"], machine=l.get("machine", ""),
+                 cdp_port=int(l["cdp_port"]),
+                 profile_dir=l.get("profile_dir", "chrome_profile"),
+                 enabled=bool(l.get("enabled", True)),
+                 project_urls=l.get("project_urls") or {})
+            for l in _lanes_raw(path).get("lanes", [])]
+
+
+def my_lanes(path: Path | None = None) -> list[Lane]:
+    """Включённые дорожки ЭТОЙ машины (по MachineGuid через карту machines).
+    GUID не в карте → пусто: безопасный дефолт — чужие дорожки не поднимать."""
+    name = _lanes_raw(path).get("machines", {}).get(machine_id(), "")
+    return [l for l in load_lanes(path) if l.enabled and l.machine == name]
+
+
+def get_lane(lane_id: str, path: Path | None = None) -> Lane | None:
+    for lane in load_lanes(path):
+        if lane.id == lane_id:
+            return lane
+    return None

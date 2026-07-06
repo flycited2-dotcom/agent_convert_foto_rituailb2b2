@@ -173,6 +173,36 @@ class AtomicClaimTest(unittest.TestCase):
         self.assertEqual(self.client.post(f"/api/requeue/{jid}",
                          headers={"x-agent-token": "T"}).status_code, 404)
 
+    # ── heartbeat по дорожкам (Phase 3): общая строка + per-lane таблица ──────
+    def _hb(self, lane=""):
+        con = sqlite3.connect(self.db)
+        con.execute("CREATE TABLE IF NOT EXISTS agent_heartbeat "
+                    "(id INTEGER PRIMARY KEY, seen_at TEXT)")
+        con.commit()
+        con.close()
+        params = {"lane": lane} if lane else {}
+        return self.client.post("/api/heartbeat",
+                                headers={"x-agent-token": "T"}, params=params)
+
+    def test_heartbeat_with_lane_writes_both_tables(self):
+        self.assertEqual(self._hb(lane="laptop-a1").status_code, 200)
+        con = sqlite3.connect(self.db)
+        # общая строка (её читает статус vps_bot — совместимость)
+        self.assertIsNotNone(con.execute(
+            "SELECT seen_at FROM agent_heartbeat WHERE id=1").fetchone())
+        # per-lane строка — видно каждую дорожку отдельно
+        row = con.execute(
+            "SELECT seen_at FROM lane_heartbeat WHERE lane='laptop-a1'").fetchone()
+        self.assertIsNotNone(row)
+
+    def test_heartbeat_without_lane_legacy_only(self):
+        self.assertEqual(self._hb().status_code, 200)
+        con = sqlite3.connect(self.db)
+        self.assertIsNotNone(con.execute(
+            "SELECT seen_at FROM agent_heartbeat WHERE id=1").fetchone())
+        n = con.execute("SELECT COUNT(*) FROM lane_heartbeat").fetchone()[0]
+        self.assertEqual(n, 0)                       # без lane per-lane строк нет
+
 
 if __name__ == "__main__":
     unittest.main()
