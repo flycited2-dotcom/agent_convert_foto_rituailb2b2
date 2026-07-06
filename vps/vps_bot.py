@@ -172,6 +172,8 @@ def init_db() -> None:
             "ALTER TABLE jobs ADD COLUMN model TEXT",
             "ALTER TABLE jobs ADD COLUMN caption TEXT",
             "ALTER TABLE jobs ADD COLUMN result_specs TEXT",
+            "ALTER TABLE jobs ADD COLUMN claimed_by TEXT",   # атомарный claim (Phase 1
+            "ALTER TABLE jobs ADD COLUMN claimed_at TEXT",   # мульти-дорожек)
         ):
             try:
                 conn.execute(ddl)
@@ -512,10 +514,12 @@ def _agent_hb_age() -> float | None:
     return (datetime.now() - datetime.fromisoformat(row["seen_at"])).total_seconds()
 
 
-# Ключи флагов: общий (старые вотчдоги — десктоп до Task 7) + адресный ноута.
-# Кнопки бота ставят команду ВСЕМ машинам (каждая заберёт свой ключ один раз);
-# адресное управление одной машиной — записью только её ключа (скриптом).
-_AGENT_FLAG_KEYS = ("agent_command", "agent_command_laptop")
+# Ключи флагов: общий (старые вотчдоги — десктоп до Task 7) + адресные машин
+# (см. config/machines.yaml в content-factory: command_key). Кнопки бота ставят
+# команду ВСЕМ машинам (каждая заберёт свой ключ один раз); адресное управление
+# одной машиной — записью только её ключа. agent_command_desktop добавлен ЗАРАНЕЕ:
+# когда десктоп-вотчдог перейдёт на worker=desktop, он не оглохнет для кнопок.
+_AGENT_FLAG_KEYS = ("agent_command", "agent_command_laptop", "agent_command_desktop")
 
 
 def _set_agent_flag(command: str) -> None:
@@ -535,12 +539,17 @@ def _set_exclusive_worker(active: str) -> None:
     active: 'laptop' | 'desktop'."""
     if active not in ("laptop", "desktop"):
         raise ValueError(f"неизвестная машина: {active!r} (ожидались laptop/desktop)")
+    lap = "start" if active == "laptop" else "stop"
+    desk = "start" if active == "desktop" else "stop"
     with db_conn() as conn:
         conn.execute("CREATE TABLE IF NOT EXISTS flags (key TEXT PRIMARY KEY, value TEXT)")
-        conn.execute("INSERT OR REPLACE INTO flags (key, value) VALUES (?, ?)",
-                     ("agent_command_laptop", "start" if active == "laptop" else "stop"))
-        conn.execute("INSERT OR REPLACE INTO flags (key, value) VALUES (?, ?)",
-                     ("agent_command", "start" if active == "desktop" else "stop"))
+        # Десктоп — по двум каналам: agent_command (legacy, старый вотчдог) и
+        # agent_command_desktop (адресный, после перехода на worker=desktop).
+        for key, val in (("agent_command_laptop", lap),
+                         ("agent_command_desktop", desk),
+                         ("agent_command", desk)):
+            conn.execute("INSERT OR REPLACE INTO flags (key, value) VALUES (?, ?)",
+                         (key, val))
         conn.commit()
 
 

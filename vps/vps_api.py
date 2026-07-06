@@ -13,8 +13,9 @@
 from __future__ import annotations
 
 import logging
+import os
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import io
@@ -27,6 +28,12 @@ from worker_lease import LEASE_TTL_SECONDS, active_worker_id
 
 log = logging.getLogger("vps_api")
 app = FastAPI(docs_url=None, redoc_url=None)  # отключаем Swagger UI в prod
+
+# Аренда claim'а задачи: processing-задача, чья дорожка молчит дольше LEASE,
+# возвращается в pending (дорожка умерла/зависла). 45 мин по умолчанию —
+# генерация с 3 ретраями может идти 15-20 мин, у живого медленного агента
+# задачу не выдёргиваем.
+JOB_LEASE_SECONDS = int(os.getenv("AGENT_JOB_LEASE_SECONDS", "2700"))
 
 
 # ---------------------------------------------------------------------------
@@ -44,30 +51,61 @@ def _auth(x_agent_token: str = Header(...)) -> None:
         raise HTTPException(status_code=403, detail="Invalid token")
 
 
+_claim_cols_ready = False
+
+
+def _ensure_claim_columns(conn: sqlite3.Connection) -> None:
+    """Идемпотентная миграция: колонки claimed_by/claimed_at в jobs (кто и когда
+    захватил задачу — фундамент мульти-дорожек). ALTER на существующей таблице,
+    не только CREATE — грабля content-factory 2026-07-05 (крэш-луп на проде)."""
+    global _claim_cols_ready
+    if _claim_cols_ready:
+        return
+    for ddl in ("ALTER TABLE jobs ADD COLUMN claimed_by TEXT",
+                "ALTER TABLE jobs ADD COLUMN claimed_at TEXT"):
+        try:
+            conn.execute(ddl)
+        except sqlite3.OperationalError:
+            pass                                  # колонка уже есть
+    _claim_cols_ready = True
+
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
 
 @app.get("/api/next-job")
-def next_job(x_agent_token: str = Header(...), caps: str = ""):
+def next_job(x_agent_token: str = Header(...), caps: str = "", lane: str = ""):
     _auth(x_agent_token)
     # caps — возможности агента (напр. "research"). Старые агенты параметр не шлют —
     # research-задачи им НЕ отдаём (не умеют и фейлили бы их «битой задачей»);
     # обычные карточки отдаём всем, как раньше.
+    # lane — id дорожки (мульти-аккаунт, Phase 1): пишется в claimed_by.
     where = "status='pending'"
     if "research" not in (caps or "").split(","):
         where += " AND mode != 'research'"
+    now = datetime.now()
     with db_conn() as conn:
-        row = conn.execute(
-            f"SELECT * FROM jobs WHERE {where} ORDER BY id LIMIT 1"
-        ).fetchone()
-        if not row:
-            return JSONResponse(status_code=204, content=None)
+        _ensure_claim_columns(conn)
+        # Аренда: задачи умерших дорожек — обратно в пул. claimed_at IS NULL не
+        # трогаем: это строки, взятые ДО апдейта (над ними может прямо сейчас
+        # работать агент) — их вернёт только явный /api/requeue.
+        cutoff = (now - timedelta(seconds=JOB_LEASE_SECONDS)).isoformat()
         conn.execute(
-            "UPDATE jobs SET status='processing', updated_at=? WHERE id=?",
-            (datetime.now().isoformat(), row["id"]),
-        )
+            "UPDATE jobs SET status='pending', claimed_by=NULL, claimed_at=NULL, "
+            "updated_at=? WHERE status='processing' AND claimed_at IS NOT NULL "
+            "AND claimed_at < ?", (now.isoformat(), cutoff))
+        # Атомарный claim: выбор и захват ОДНИМ запросом (SQLite ≥3.35, на VPS
+        # 3.45) — две дорожки не получат одну задачу. Раньше SELECT и UPDATE шли
+        # раздельно — параллельные агенты хватали один и тот же job.
+        row = conn.execute(
+            f"UPDATE jobs SET status='processing', claimed_by=?, claimed_at=?, "
+            f"updated_at=? WHERE id=(SELECT id FROM jobs WHERE {where} "
+            f"ORDER BY id LIMIT 1) RETURNING *",
+            (lane or None, now.isoformat(), now.isoformat())).fetchone()
         conn.commit()
+    if not row:
+        return JSONResponse(status_code=204, content=None)
     keys = row.keys()
     mode  = (row["mode"]  if "mode"  in keys else None) or "ritual"
     specs = (row["specs"] if "specs" in keys else None) or ""
@@ -81,6 +119,24 @@ def next_job(x_agent_token: str = Header(...), caps: str = ""):
         "brand": brand,
         "model": model,
     }
+
+
+@app.post("/api/requeue/{job_id}")
+def requeue_job(job_id: int, x_agent_token: str = Header(...)):
+    """Мягкий возврат задачи в очередь (дорожка упёрлась в лимит ChatGPT и уходит
+    остывать): status='pending', claim снят, попытка НЕ сожжена (это не /api/fail).
+    404 — задачи нет или она не processing (двойной requeue не ломает pending)."""
+    _auth(x_agent_token)
+    with db_conn() as conn:
+        _ensure_claim_columns(conn)
+        cur = conn.execute(
+            "UPDATE jobs SET status='pending', claimed_by=NULL, claimed_at=NULL, "
+            "updated_at=? WHERE id=? AND status='processing'",
+            (datetime.now().isoformat(), job_id))
+        conn.commit()
+    if cur.rowcount == 0:
+        raise HTTPException(status_code=404, detail="Job not found or not processing")
+    return {"ok": True}
 
 
 @app.get("/api/input/{job_id}")

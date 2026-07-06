@@ -39,23 +39,29 @@ def _flags(db) -> dict:
     return {r["key"]: r["value"] for r in rows}
 
 
+# Десктоп получает команду по ДВУМ каналам: agent_command (legacy, старый вотчдог)
+# и agent_command_desktop (адресный — после перехода на worker=desktop). Иначе
+# при переключении десктопа на адресный ключ он оглох бы для кнопок бота.
 def test_only_laptop_starts_laptop_stops_desktop(tmp_path, monkeypatch):
     bot, db = _bot_with_db(tmp_path, monkeypatch)
     bot._set_exclusive_worker("laptop")
-    assert _flags(db) == {"agent_command_laptop": "start", "agent_command": "stop"}
+    assert _flags(db) == {"agent_command_laptop": "start",
+                          "agent_command_desktop": "stop", "agent_command": "stop"}
 
 
 def test_only_desktop_starts_desktop_stops_laptop(tmp_path, monkeypatch):
     bot, db = _bot_with_db(tmp_path, monkeypatch)
     bot._set_exclusive_worker("desktop")
-    assert _flags(db) == {"agent_command_laptop": "stop", "agent_command": "start"}
+    assert _flags(db) == {"agent_command_laptop": "stop",
+                          "agent_command_desktop": "start", "agent_command": "start"}
 
 
 def test_switch_is_idempotent_overwrites_previous(tmp_path, monkeypatch):
     bot, db = _bot_with_db(tmp_path, monkeypatch)
     bot._set_exclusive_worker("desktop")
     bot._set_exclusive_worker("laptop")           # передумали — переключили обратно
-    assert _flags(db) == {"agent_command_laptop": "start", "agent_command": "stop"}
+    assert _flags(db) == {"agent_command_laptop": "start",
+                          "agent_command_desktop": "stop", "agent_command": "stop"}
 
 
 def test_rejects_unknown_worker_name(tmp_path, monkeypatch):
