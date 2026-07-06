@@ -20,7 +20,7 @@
       "account": "acc2",
       "cdp_port": 9334,
       "profile_dir": "chrome_profile_acc2",
-      "enabled": false,
+      "enabled": true,
       "modes": ["mcp", "kbt", "research"],
       "project_urls": {
         "mcp": "env:MCP_PROJECT_URL_ACC2",
