@@ -497,12 +497,15 @@ async def cmd_agent_status(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None
         icon = "🔴"
         label = "Офлайн"
     pending = _pending_count()
-    await update.message.reply_text(
-        f"Агент: {icon} {label}\n"
-        f"Последний контакт: {int(age)} сек. назад\n"
-        f"В очереди: {pending}",
-        reply_markup=MAIN_KEYBOARD,
-    )
+    text = (f"Агент: {icon} {label}\n"
+            f"Последний контакт: {int(age)} сек. назад\n"
+            f"В очереди: {pending}")
+    lanes = _lane_heartbeats()
+    if lanes:                              # мульти-дорожки: каждая отдельной строкой
+        text += "\nДорожки:\n" + "\n".join(
+            f"  {'🟢' if a < 30 else '🟡' if a < 120 else '🔴'} {lane}: {int(a)} сек. назад"
+            for lane, a in lanes)
+    await update.message.reply_text(text, reply_markup=MAIN_KEYBOARD)
 
 
 def _agent_hb_age() -> float | None:
@@ -512,6 +515,20 @@ def _agent_hb_age() -> float | None:
     if not row or not row["seen_at"]:
         return None
     return (datetime.now() - datetime.fromisoformat(row["seen_at"])).total_seconds()
+
+
+def _lane_heartbeats() -> list[tuple[str, float]]:
+    """(lane, возраст сек) по дорожкам из lane_heartbeat (Phase 3). Таблицы нет /
+    пусто → [] (одноканальный режим — в статусе ничего лишнего)."""
+    try:
+        with db_conn() as conn:
+            rows = conn.execute("SELECT lane, seen_at FROM lane_heartbeat "
+                                "ORDER BY lane").fetchall()
+    except sqlite3.OperationalError:
+        return []                          # таблицы ещё нет — API её создаст
+    now = datetime.now()
+    return [(r["lane"], (now - datetime.fromisoformat(r["seen_at"])).total_seconds())
+            for r in rows if r["seen_at"]]
 
 
 # Ключи флагов: общий (старые вотчдоги — десктоп до Task 7) + адресные машин
