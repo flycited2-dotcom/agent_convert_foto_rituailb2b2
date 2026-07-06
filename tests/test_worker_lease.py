@@ -68,12 +68,54 @@ def _api_with_db(tmp_path, monkeypatch):
 
 
 def test_lease_endpoint_desktop_then_laptop(tmp_path, monkeypatch):
+    # account="" явно: при прямом вызове (без FastAPI) дефолт остался бы Form-объектом
     api = _api_with_db(tmp_path, monkeypatch)
-    res_d = api.worker_lease(x_agent_token="", worker_id="desktop", priority=1)
+    res_d = api.worker_lease(x_agent_token="", worker_id="desktop", priority=1,
+                             account="")
     assert res_d["active"] is True
-    res_l = api.worker_lease(x_agent_token="", worker_id="laptop", priority=2)
+    res_l = api.worker_lease(x_agent_token="", worker_id="laptop", priority=2,
+                             account="")
     assert res_l["active"] is False
     assert res_l["active_worker"] == "desktop"
+
+
+# ─── Аренда per-АККАУНТ (Phase 6, фикс 2026-07-06): дорожки РАЗНЫХ аккаунтов
+# работают параллельно; глобальный выбор одного активного оставлял laptop-a2
+# в вечном standby («lease=acc2, активен другой») при живом laptop-a1/acc1. ───
+
+def test_lease_different_accounts_both_active(tmp_path, monkeypatch):
+    api = _api_with_db(tmp_path, monkeypatch)
+    res_a1 = api.worker_lease(x_agent_token="", worker_id="laptop-a1",
+                              priority=2, account="acc1")
+    res_a2 = api.worker_lease(x_agent_token="", worker_id="laptop-a2",
+                              priority=2, account="acc2")
+    assert res_a1["active"] is True
+    assert res_a2["active"] is True                # своя группа — не конкурируют
+
+
+def test_lease_same_account_two_machines_desktop_wins(tmp_path, monkeypatch):
+    api = _api_with_db(tmp_path, monkeypatch)
+    res_d = api.worker_lease(x_agent_token="", worker_id="desktop-a1",
+                             priority=1, account="acc1")
+    res_l = api.worker_lease(x_agent_token="", worker_id="laptop-a1",
+                             priority=2, account="acc1")
+    assert res_d["active"] is True
+    assert res_l["active"] is False                # один аккаунт — работает один
+    assert res_l["active_worker"] == "desktop-a1"
+
+
+def test_lease_legacy_no_account_shares_one_group(tmp_path, monkeypatch):
+    # старые клиенты без account (WORKER_ID=desktop/laptop) — общая legacy-группа,
+    # прежний failover сохраняется
+    api = _api_with_db(tmp_path, monkeypatch)
+    api.worker_lease(x_agent_token="", worker_id="desktop", priority=1, account="")
+    res_l = api.worker_lease(x_agent_token="", worker_id="laptop", priority=2,
+                             account="")
+    assert res_l["active"] is False
+    # lane-клиент с аккаунтом не конкурирует с legacy-группой
+    res_a2 = api.worker_lease(x_agent_token="", worker_id="laptop-a2",
+                              priority=2, account="acc2")
+    assert res_a2["active"] is True
 
 
 # ─── Клиентский claim_lease (async через asyncio.run, без pytest-asyncio) ───

@@ -242,26 +242,37 @@ def worker_lease(
     x_agent_token: str = Header(...),
     worker_id: str = Form(...),
     priority: int = Form(100),
+    account: str = Form(""),
 ):
     """Воркер регистрирует heartbeat и спрашивает, активен ли он сейчас.
-    active=True → можно брать задачи; False → standby (генерит другой)."""
+    active=True → можно брать задачи; False → standby (генерит другой).
+    account — группа аренды (Phase 6): активный выбирается ВНУТРИ группы,
+    дорожки разных аккаунтов работают параллельно (фикс 2026-07-06: глобальный
+    выбор одного активного держал laptop-a2 в вечном standby). Пустой account —
+    общая legacy-группа (старые клиенты: прежний failover desktop/laptop)."""
     _auth(x_agent_token)
     now = datetime.now()
     with db_conn() as conn:
         conn.execute(
             "CREATE TABLE IF NOT EXISTS workers ("
             "worker_id TEXT PRIMARY KEY, priority INTEGER NOT NULL DEFAULT 100, "
-            "seen_at TEXT NOT NULL)"
+            "seen_at TEXT NOT NULL, account TEXT NOT NULL DEFAULT '')"
         )
+        try:  # миграция уже существующей таблицы (SQLite: колонку — только ALTER)
+            conn.execute("ALTER TABLE workers ADD COLUMN account TEXT NOT NULL DEFAULT ''")
+        except sqlite3.OperationalError:
+            pass                                   # колонка уже есть
         conn.execute(
-            "INSERT INTO workers (worker_id, priority, seen_at) VALUES (?, ?, ?) "
+            "INSERT INTO workers (worker_id, priority, seen_at, account) "
+            "VALUES (?, ?, ?, ?) "
             "ON CONFLICT(worker_id) DO UPDATE SET priority=excluded.priority, "
-            "seen_at=excluded.seen_at",
-            (worker_id, priority, now.isoformat()),
+            "seen_at=excluded.seen_at, account=excluded.account",
+            (worker_id, priority, now.isoformat(), account),
         )
         conn.commit()
         rows = [dict(r) for r in conn.execute(
-            "SELECT worker_id, priority, seen_at FROM workers"
+            "SELECT worker_id, priority, seen_at FROM workers "
+            "WHERE COALESCE(account, '') = ?", (account,)
         ).fetchall()]
     active_id = active_worker_id(rows, now, LEASE_TTL_SECONDS)
     return {"active": active_id == worker_id, "worker_id": worker_id,

@@ -49,10 +49,12 @@ if LANE_ID and LANE is None:
     raise SystemExit(f"LANE_ID={LANE_ID!r} не найден в lanes.json — проверь id дорожки")
 # CDP своей дорожки; без дорожки — модульный (одноканальный режим, как раньше)
 CDP_URL = LANE.cdp_url if LANE else CHROME_CDP_URL
-# Арендный ключ failover-лиза — АККАУНТ дорожки (Phase 6): дорожки одного
-# аккаунта на разных машинах не молотят параллельно, разных — молотят.
-# Без дорожки — WORKER_ID (машинный лиз, как раньше).
-LEASE_ID = (LANE.account if LANE else "") or WORKER_ID
+# Аренда failover-лиза (Phase 6, фикс 2026-07-06): claim'ер — уникальное имя
+# (id дорожки; без дорожки — WORKER_ID), группа аренды — АККАУНТ дорожки:
+# дорожки одного аккаунта на разных машинах не молотят параллельно, разных —
+# молотят. Без дорожки account пуст → общая legacy-группа (failover как раньше).
+LEASE_ID = (LANE.id if LANE else "") or WORKER_ID
+LEASE_ACCOUNT = (LANE.account if LANE else "")
 from agent import UploadLimitError, process_one_file, process_research  # noqa: E402
 from ssh_tunnel import SSHTunnel  # noqa: E402
 from worker_lease_client import claim_lease  # noqa: E402
@@ -150,10 +152,11 @@ async def agent_loop(api_url: str) -> None:
                 # они работают параллельно) ---
                 if LEASE_ID:
                     active = await claim_lease(client, api_url, VPS_API_TOKEN,
-                                               LEASE_ID, WORKER_PRIORITY)
+                                               LEASE_ID, WORKER_PRIORITY,
+                                               account=LEASE_ACCOUNT)
                     if not active:
-                        log.info("standby (lease=%s, активен другой) — жду %d сек.",
-                                 LEASE_ID, POLL_INTERVAL)
+                        log.info("standby (lease=%s/%s, активен другой) — жду %d сек.",
+                                 LEASE_ID, LEASE_ACCOUNT or "-", POLL_INTERVAL)
                         await asyncio.sleep(POLL_INTERVAL)
                         continue
 
