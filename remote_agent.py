@@ -253,6 +253,16 @@ async def agent_loop(api_url: str) -> None:
 
                 # --- Скачиваем входной файл ---
                 r = await client.get(f"{api_url}/api/input/{job_id}", headers=headers)
+                if r.status_code == 404:
+                    # Входной файл пропал из input/ (блуждающая грабля VPS) — задача
+                    # битая, ретраи бессмысленны: это не сеть. Без fail она вечно
+                    # циклится claim → 404 → аренда вернёт в pending → снова claim
+                    # («зависание и тишина», job 699 2026-07-07).
+                    log.error("Задача %d: входной файл пропал (404) — помечаю failed.", job_id)
+                    await client.post(
+                        f"{api_url}/api/fail/{job_id}", headers=headers,
+                        data={"error": "входной файл пропал из input/ (404)"})
+                    continue
                 r.raise_for_status()
                 suffix = Path(input_filename).suffix or ".jpg"
                 tmp_input = ROOT / "input" / f"remote_{job_id}{suffix}"
