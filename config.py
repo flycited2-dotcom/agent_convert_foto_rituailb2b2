@@ -238,6 +238,10 @@ class Lane:
     profile_dir: str = "chrome_profile"
     enabled: bool = True
     project_urls: dict | None = None
+    # Аккаунт ChatGPT дорожки — арендный ключ (Phase 6): дорожки ОДНОГО аккаунта
+    # на разных машинах не работают параллельно (failover-лиз workers), разных —
+    # работают. Пусто в json → id дорожки (ни с кем не связана).
+    account: str = ""
 
     @property
     def cdp_url(self) -> str:
@@ -282,7 +286,8 @@ def load_lanes(path: Path | None = None) -> list[Lane]:
                  cdp_port=int(l["cdp_port"]),
                  profile_dir=l.get("profile_dir", "chrome_profile"),
                  enabled=bool(l.get("enabled", True)),
-                 project_urls=l.get("project_urls") or {})
+                 project_urls=l.get("project_urls") or {},
+                 account=(l.get("account") or l["id"]))
             for l in _lanes_raw(path).get("lanes", [])]
 
 

@@ -8,6 +8,7 @@
     {
       "id": "laptop-a1",
       "machine": "laptop",
+      "account": "acc1",
       "cdp_port": 9333,
       "profile_dir": "chrome_profile",
       "enabled": true,
@@ -16,6 +17,7 @@
     {
       "id": "laptop-a2",
       "machine": "laptop",
+      "account": "acc2",
       "cdp_port": 9334,
       "profile_dir": "chrome_profile_acc2",
       "enabled": false,
@@ -28,6 +30,7 @@
     {
       "id": "desktop-a1",
       "machine": "desktop",
+      "account": "acc1",
       "cdp_port": 9333,
       "profile_dir": "chrome_profile",
       "enabled": true,

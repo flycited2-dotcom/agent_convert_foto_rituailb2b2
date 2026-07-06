@@ -49,6 +49,10 @@ if LANE_ID and LANE is None:
     raise SystemExit(f"LANE_ID={LANE_ID!r} не найден в lanes.json — проверь id дорожки")
 # CDP своей дорожки; без дорожки — модульный (одноканальный режим, как раньше)
 CDP_URL = LANE.cdp_url if LANE else CHROME_CDP_URL
+# Арендный ключ failover-лиза — АККАУНТ дорожки (Phase 6): дорожки одного
+# аккаунта на разных машинах не молотят параллельно, разных — молотят.
+# Без дорожки — WORKER_ID (машинный лиз, как раньше).
+LEASE_ID = (LANE.account if LANE else "") or WORKER_ID
 from agent import UploadLimitError, process_one_file, process_research  # noqa: E402
 from ssh_tunnel import SSHTunnel  # noqa: E402
 from worker_lease_client import claim_lease  # noqa: E402
@@ -141,13 +145,15 @@ async def agent_loop(api_url: str) -> None:
                     await asyncio.sleep(POLL_INTERVAL)
                     continue
 
-                # --- Failover-лиз: если активен другой воркер, в standby ---
-                if WORKER_ID:
+                # --- Failover-лиз (по аккаунту): если этот же аккаунт активен
+                # на другой машине — в standby (у разных аккаунтов ключи разные,
+                # они работают параллельно) ---
+                if LEASE_ID:
                     active = await claim_lease(client, api_url, VPS_API_TOKEN,
-                                               WORKER_ID, WORKER_PRIORITY)
+                                               LEASE_ID, WORKER_PRIORITY)
                     if not active:
-                        log.info("standby (worker=%s, активен другой) — жду %d сек.",
-                                 WORKER_ID, POLL_INTERVAL)
+                        log.info("standby (lease=%s, активен другой) — жду %d сек.",
+                                 LEASE_ID, POLL_INTERVAL)
                         await asyncio.sleep(POLL_INTERVAL)
                         continue
 
@@ -249,6 +255,7 @@ async def agent_loop(api_url: str) -> None:
                 output_path: Path | None = None
                 MAX_ATTEMPTS = 3
                 last_error: Exception | None = None
+                requeue_job = False       # лимит ChatGPT: вернуть задачу в pending
 
                 try:
                     for attempt in range(1, MAX_ATTEMPTS + 1):
@@ -272,20 +279,42 @@ async def agent_loop(api_url: str) -> None:
                         except UploadLimitError as e:
                             # Ретраить бессмысленно и вредно: квота меньше всего
                             # восстановится, если долбить её ретраями (2026-07-03).
-                            # Уходим в кулдаун и НЕ жжём оставшиеся попытки.
+                            # Кулдаун + мягкий возврат задачи в очередь (Phase 4):
+                            # не failed — попытка конвейера не сжигается, задачу
+                            # доберёт другая дорожка или я после кулдауна.
                             last_error = e
+                            requeue_job = True
                             until = upload_cooldown.start_cooldown(
                                 COOLDOWN_PATH, datetime.now(), COOLDOWN_MINUTES)
                             log.error(
                                 "Задача %d: лимит загрузок ChatGPT исчерпан (%s) — "
-                                "кулдаун до %s, попытки не трачу.", job_id, e, until)
+                                "кулдаун до %s, задачу возвращаю в очередь.",
+                                job_id, e, until)
                             break
 
                         except Exception as e:
                             last_error = e
                             log.warning("Попытка %d/%d не удалась: %s", attempt, MAX_ATTEMPTS, e)
 
-                    if last_error is not None:
+                    if requeue_job:
+                        # Лимит ChatGPT: мягкий возврат (pending, claim снят).
+                        # Если requeue не прошёл (сеть/старый API) — фолбэк в fail,
+                        # чтобы задача не зависла в processing навсегда.
+                        try:
+                            r = await client.post(f"{api_url}/api/requeue/{job_id}",
+                                                  headers=headers)
+                            r.raise_for_status()
+                            log.info("Задача %d возвращена в очередь (pending).", job_id)
+                        except Exception as re_err:
+                            log.error("requeue задачи %d не прошёл (%s) — помечаю failed.",
+                                      job_id, re_err)
+                            try:
+                                await client.post(f"{api_url}/api/fail/{job_id}",
+                                                  headers=headers,
+                                                  data={"error": str(last_error)})
+                            except Exception:
+                                pass
+                    elif last_error is not None:
                         # Все попытки провалились — сообщаем VPS
                         log.error("Задача %d провалилась после %d попыток: %s", job_id, MAX_ATTEMPTS, last_error)
                         try:

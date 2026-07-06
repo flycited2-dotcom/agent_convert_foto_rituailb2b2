@@ -85,3 +85,17 @@ def test_project_url_env_missing_is_empty(tmp_path, monkeypatch):
     monkeypatch.delenv("MCP_PROJECT_URL_ACC2", raising=False)
     lane = get_lane("laptop-a2", _write(tmp_path, lanes=LANES))
     assert lane.project_url_for("mcp") == ""
+
+
+def test_lane_account_explicit_and_default(tmp_path):
+    # account — арендный ключ (Phase 6): дорожки ОДНОГО аккаунта на разных
+    # машинах не работают параллельно (lease), разных — работают.
+    lanes = [
+        {"id": "laptop-a1", "machine": "laptop", "cdp_port": 9333, "account": "acc1"},
+        {"id": "desktop-a1", "machine": "desktop", "cdp_port": 9333, "account": "acc1"},
+        {"id": "laptop-a2", "machine": "laptop", "cdp_port": 9334},   # без account
+    ]
+    p = _write(tmp_path, lanes=lanes)
+    assert get_lane("laptop-a1", p).account == "acc1"
+    assert get_lane("desktop-a1", p).account == "acc1"    # тот же аккаунт → одна аренда
+    assert get_lane("laptop-a2", p).account == "laptop-a2"  # дефолт = id (без связки)
