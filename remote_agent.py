@@ -55,9 +55,16 @@ if LANE_ID and LANE is None:
 CDP_URL = LANE.cdp_url if LANE else CHROME_CDP_URL
 def agent_caps() -> str:
     """Возможности агента для /api/next-job. research заявляем ТОЛЬКО если режим
-    настроен (RESEARCH_PROJECT_URL/промпт): десктоп без этих env брал
-    research-задачи и жёг их «режим не настроен» (job 731, 2026-07-07)."""
-    return "research" if get_mode("research").is_configured else ""
+    реально выполним: URL — модульный (RESEARCH_PROJECT_URL) ИЛИ override
+    дорожки (project_urls.research в lanes.json) + промпт. Десктоп без env брал
+    research и жёг их (job 731); а caps без учёта override давал дедлок —
+    desktop-a2 МОГ research через RESEARCH_PROJECT_URL_ACC2, но молчал,
+    ноут же в standby по аренде (2026-07-07)."""
+    cfg = get_mode("research")
+    url = ((LANE.project_url_for("research") if LANE else "")
+           or cfg.project_url)
+    ok = cfg.enabled and bool(url) and bool((cfg.prompt or "").strip())
+    return "research" if ok else ""
 
 
 from agent import UploadLimitError, process_one_file, process_research  # noqa: E402

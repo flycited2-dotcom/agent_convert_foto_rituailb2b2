@@ -474,7 +474,10 @@ async def process_research(brand: str | None, model: str | None,
     cdp_url/project_url — переопределения от дорожки (None = как раньше)."""
     from config import RESEARCH_IMAGE_PROMPT
     cfg = get_mode("research")
-    if cfg.key != "research" or not cfg.is_configured:
+    # URL может прийти override'ом дорожки (acc2) — модульный env тогда не обязателен
+    effective_url = (project_url or cfg.project_url or "").strip()
+    if (cfg.key != "research" or not cfg.enabled or not effective_url
+            or not (cfg.prompt or "").strip()):
         raise RuntimeError("Режим 'research' не настроен: нет RESEARCH_PROJECT_URL/промпта")
     product = " ".join(x for x in (category, brand, model) if x).strip()
     output_path = make_output_path(mode="research", brand=brand, model=model)
