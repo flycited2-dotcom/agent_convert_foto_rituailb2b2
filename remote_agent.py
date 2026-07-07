@@ -22,9 +22,13 @@ load_dotenv(ROOT / ".env")
 
 from datetime import datetime, timedelta  # noqa: E402
 
-# Дорожка (lane, Phase 3 мульти-аккаунта): LANE_ID из env/CLI → свой CDP-порт,
+# Дорожка (lane, Phase 3 мульти-аккаунта): LANE_ID из CLI/env → свой CDP-порт,
 # per-mode project_url и отдельный лог. Без LANE_ID — поведение как раньше.
-LANE_ID = (sys.argv[1] if len(sys.argv) > 1 else os.getenv("LANE_ID", "")).strip()
+# argv учитываем ТОЛЬКО при прямом запуске remote_agent.py: при импорте из
+# pytest argv[1] — путь теста, он ломал имя лог-файла (грабля 2026-07-07).
+_argv_lane = (sys.argv[1] if len(sys.argv) > 1
+              and Path(sys.argv[0]).name == "remote_agent.py" else "")
+LANE_ID = (_argv_lane or os.getenv("LANE_ID", "")).strip()
 
 # Логирование настраиваем ДО импорта agent.py — иначе agent.basicConfig
 # перехватит все логи в agent.log. force=True перебивает любой предыдущий конфиг.
@@ -49,12 +53,13 @@ if LANE_ID and LANE is None:
     raise SystemExit(f"LANE_ID={LANE_ID!r} не найден в lanes.json — проверь id дорожки")
 # CDP своей дорожки; без дорожки — модульный (одноканальный режим, как раньше)
 CDP_URL = LANE.cdp_url if LANE else CHROME_CDP_URL
-# Аренда failover-лиза (Phase 6, фикс 2026-07-06): claim'ер — уникальное имя
-# (id дорожки; без дорожки — WORKER_ID), группа аренды — АККАУНТ дорожки:
-# дорожки одного аккаунта на разных машинах не молотят параллельно, разных —
-# молотят. Без дорожки account пуст → общая legacy-группа (failover как раньше).
-LEASE_ID = (LANE.id if LANE else "") or WORKER_ID
-LEASE_ACCOUNT = (LANE.account if LANE else "")
+def agent_caps() -> str:
+    """Возможности агента для /api/next-job. research заявляем ТОЛЬКО если режим
+    настроен (RESEARCH_PROJECT_URL/промпт): десктоп без этих env брал
+    research-задачи и жёг их «режим не настроен» (job 731, 2026-07-07)."""
+    return "research" if get_mode("research").is_configured else ""
+
+
 from agent import UploadLimitError, process_one_file, process_research  # noqa: E402
 from ssh_tunnel import SSHTunnel  # noqa: E402
 from worker_lease_client import claim_lease  # noqa: E402
@@ -76,6 +81,15 @@ VPS_API_TOKEN = os.getenv("VPS_API_TOKEN", "")
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL_SEC", "10"))
 WORKER_ID       = os.getenv("WORKER_ID", "").strip()
 WORKER_PRIORITY = int(os.getenv("WORKER_PRIORITY", "100"))
+
+# Аренда failover-лиза (Phase 6, фикс 2026-07-06): claim'ер — уникальное имя
+# (id дорожки; без дорожки — WORKER_ID), группа аренды — АККАУНТ дорожки:
+# дорожки одного аккаунта на разных машинах не молотят параллельно, разных —
+# молотят. Без дорожки account пуст → общая legacy-группа (failover как раньше).
+# (Блок обязан жить НИЖЕ WORKER_ID: раньше он стоял до его определения и падал
+# NameError при запуске без дорожки — latent, вскрыт тестом 2026-07-07.)
+LEASE_ID = (LANE.id if LANE else "") or WORKER_ID
+LEASE_ACCOUNT = (LANE.account if LANE else "")
 
 
 # ---------------------------------------------------------------------------
@@ -171,10 +185,10 @@ async def agent_loop(api_url: str) -> None:
                     await asyncio.sleep(30)
                     continue
 
-                # --- Получаем следующую задачу (caps: этот агент умеет research;
+                # --- Получаем следующую задачу (caps — что агент реально умеет;
                 # lane уходит в claimed_by; modes — allowlist режимов дорожки:
                 # чужой mode открыл бы не тот проект/аккаунт) ---
-                _params = {"caps": "research", "lane": LANE_ID or WORKER_ID}
+                _params = {"caps": agent_caps(), "lane": LANE_ID or WORKER_ID}
                 if LANE and LANE.modes:
                     _params["modes"] = ",".join(LANE.modes)
                 r = await client.get(f"{api_url}/api/next-job", headers=headers,
