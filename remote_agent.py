@@ -100,6 +100,78 @@ LEASE_ACCOUNT = (LANE.account if LANE else "")
 
 
 # ---------------------------------------------------------------------------
+# Самолечение «зомби-Chrome» (3 случая 06-07.07.2026): /json/version отвечает
+# (вотчдог считает живым), но connect_over_cdp виснет 180с — задачи горели
+# пачками, Chrome пересоздавали руками. Агент — единственный, кто ВИДИТ этот
+# симптом, поэтому лечит сам: kill своего Chrome по порту → start_chrome.bat
+# со своими портом/профилем → дождаться CDP. Задача при этом уходит в requeue.
+# ---------------------------------------------------------------------------
+_CDP_HEAL_COOLDOWN_SEC = int(os.getenv("CDP_HEAL_COOLDOWN_SEC", "600"))
+_last_chrome_heal: datetime | None = None
+
+
+def _is_cdp_attach_timeout(e: Exception) -> bool:
+    """Зомби-сигнатура: таймаут именно на connect_over_cdp (не селекторы и пр.)."""
+    s = str(e)
+    return "connect_over_cdp" in s and "Timeout" in s
+
+
+def _kill_chrome_by_port() -> None:
+    """Убить ТОЛЬКО Chrome своего CDP-порта (личный Chrome порт не содержит)."""
+    import subprocess
+    port = CDP_URL.rsplit(":", 1)[-1]
+    cond = ("$_.Name -eq 'chrome.exe' -and "
+            f"$_.CommandLine -match 'remote-debugging-port={port}'")
+    subprocess.run(
+        ["powershell", "-NoProfile", "-Command",
+         f"Get-CimInstance Win32_Process | Where-Object {{{cond}}} "
+         "| ForEach-Object { Stop-Process -Id $_.ProcessId -Force }"],
+        capture_output=True, text=True, timeout=30,
+        creationflags=subprocess.CREATE_NO_WINDOW)
+
+
+def _start_chrome() -> None:
+    """Поднять свой Chrome (порт/профиль дорожки; без дорожки — дефолты bat)."""
+    import subprocess
+    cmd = ["cmd", "/c", str(ROOT / "start_chrome.bat")]
+    if LANE:
+        cmd += [str(LANE.cdp_port), LANE.profile_dir]
+    subprocess.Popen(cmd, cwd=ROOT, creationflags=subprocess.CREATE_NO_WINDOW)
+
+
+def _wait_cdp(timeout: int = 30) -> bool:
+    import time as _t
+    deadline = _t.monotonic() + timeout
+    while _t.monotonic() < deadline:
+        try:
+            httpx.get(f"{CDP_URL}/json/version", timeout=3, trust_env=False)
+            return True
+        except Exception:
+            _t.sleep(1)
+    return False
+
+
+def heal_chrome() -> bool:
+    """Пересоздать свой Chrome. False — лечили недавно (кулдаун защищает от
+    вечного kill-цикла, если причина глубже) — тогда задача фейлится штатно."""
+    global _last_chrome_heal
+    now = datetime.now()
+    if (_last_chrome_heal is not None
+            and (now - _last_chrome_heal).total_seconds() < _CDP_HEAL_COOLDOWN_SEC):
+        log.warning("Зомби-Chrome: лечили < %d сек назад — пропускаю (кулдаун).",
+                    _CDP_HEAL_COOLDOWN_SEC)
+        return False
+    _last_chrome_heal = now
+    log.warning("Зомби-Chrome (attach-timeout при живом HTTP) — пересоздаю "
+                "Chrome %s…", CDP_URL)
+    _kill_chrome_by_port()
+    _start_chrome()
+    ok = _wait_cdp()
+    log.warning("Chrome пересоздан: CDP %s", "жив" if ok else "НЕ поднялся за 30с")
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Основной цикл агента
 # ---------------------------------------------------------------------------
 
@@ -249,8 +321,23 @@ async def agent_loop(api_url: str) -> None:
                             break
                         except Exception as e:
                             last_error = e
+                            if _is_cdp_attach_timeout(e):
+                                # зомби-Chrome: лечим и возвращаем задачу в пул
+                                # (попытки не жжём); кулдаун → штатный fail ниже
+                                if heal_chrome():
+                                    last_error = "requeue"
+                                    break
+                                break
                             log.warning("research: попытка %d/3 не удалась: %s", attempt, e)
-                    if last_error is not None:
+                    if last_error == "requeue":
+                        try:
+                            await client.post(f"{api_url}/api/requeue/{job_id}",
+                                              headers=headers)
+                            log.info("research-задача %d возвращена в очередь "
+                                     "(зомби-Chrome вылечен).", job_id)
+                        except Exception:
+                            pass
+                    elif last_error is not None:
                         log.error("research-задача %d провалилась: %s", job_id, last_error)
                         try:
                             await client.post(f"{api_url}/api/fail/{job_id}",
@@ -331,6 +418,12 @@ async def agent_loop(api_url: str) -> None:
 
                         except Exception as e:
                             last_error = e
+                            if _is_cdp_attach_timeout(e):
+                                # зомби-Chrome: лечим, задачу — мягко в очередь
+                                # (попытки не жжём); кулдаун → штатный fail
+                                if heal_chrome():
+                                    requeue_job = True
+                                break
                             log.warning("Попытка %d/%d не удалась: %s", attempt, MAX_ATTEMPTS, e)
 
                     if requeue_job:
