@@ -36,6 +36,20 @@
       "profile_dir": "chrome_profile",
       "enabled": true,
       "project_urls": {}
+    },
+    {
+      "id": "desktop-a2",
+      "machine": "desktop",
+      "account": "acc2",
+      "cdp_port": 9334,
+      "profile_dir": "chrome_profile_acc2",
+      "enabled": true,
+      "modes": ["mcp", "kbt", "research"],
+      "project_urls": {
+        "mcp": "env:MCP_PROJECT_URL_ACC2",
+        "kbt": "env:KBT_PROJECT_URL_ACC2",
+        "research": "env:RESEARCH_PROJECT_URL_ACC2"
+      }
     }
   ]
 }
