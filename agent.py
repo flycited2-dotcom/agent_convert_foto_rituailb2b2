@@ -45,20 +45,18 @@ COMPOSER_SELECTOR = 'div[contenteditable="true"]'
 # baselineList — src которые БЫЛИ на странице после submit+5s settle.
 # Все user-фото к этому моменту уже имеют финальные URL и попадают сюда.
 #
-# Стратегия 1 (приоритет): картинка внутри последнего assistant-message.
-#   Селекторы: [data-message-author-role="assistant"], [data-author-role="assistant"],
-#   [data-testid^="conversation-turn-"][data-turn="assistant"].
-#
-# Стратегия 2 (fallback, если разметка assistant-role изменилась):
-#   Любая крупная свежая картинка, которая НЕ внутри role="user" контейнера.
-#   Это защищает от input-фото (они физически в role="user").
+# ТОЛЬКО последнее assistant-сообщение. Бывший fallback «любая крупная свежая
+# картинка вне user-сообщений» ПРИКЛЕИВАЛ ЧУЖИЕ ФОТО (2026-07-07: карточка
+# EUROHOFF с фото телевизора BQ): превью прошлых генераций проекта подгружаются
+# лениво ПОСЛЕ снятия baseline и проходили фильтр «свежая + вне user».
+# Осознанный трейдофф: сменится разметка assistant-role — упадём с дампом
+# страницы (ретрай/алерт), но чужое фото в карточку не уедет никогда.
 FIND_GENERATED_IMG_JS = """
     (baselineList) => {
         const baseline = new Set(baselineList || []);
         const isFresh = im => im.complete && im.naturalWidth > 600
                               && im.src && !baseline.has(im.src);
 
-        // Стратегия 1: assistant role
         const aSelector = [
             '[data-message-author-role=\\"assistant\\"]',
             '[data-author-role=\\"assistant\\"]'
@@ -68,20 +66,6 @@ FIND_GENERATED_IMG_JS = """
             const last = aMsgs[aMsgs.length - 1];
             const cand = [...last.querySelectorAll('img')].filter(isFresh);
             if (cand.length) return cand[cand.length - 1];
-        }
-
-        // Стратегия 2 (fallback): крупная свежая картинка ВНЕ user-сообщений
-        const uSelector = [
-            '[data-message-author-role=\\"user\\"]',
-            '[data-author-role=\\"user\\"]'
-        ].join(', ');
-        const uMsgs = [...document.querySelectorAll(uSelector)];
-        const inUser = im => uMsgs.some(m => m.contains(im));
-
-        const all = [...document.querySelectorAll('img')]
-            .filter(im => isFresh(im) && !inUser(im));
-        if (all.length) {
-            return all.sort((a, b) => b.naturalWidth - a.naturalWidth)[0];
         }
         return null;
     }
