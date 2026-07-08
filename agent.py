@@ -226,8 +226,11 @@ async def wait_for_generation(
     while elapsed < deadline_ms:
         try:
             # ChatGPT виртуализирует ленту: последний turn выпадает из DOM при
-            # скролле вверх. Держим низ в поле зрения, иначе детект не увидит картинку.
-            await page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
+            # скролле вверх. Лента скроллится во ВНУТРЕННЕМ контейнере, не в window,
+            # поэтому доводим до низа именно последний turn (двигает нужный скроллер).
+            await page.evaluate(
+                "() => { const t = document.querySelectorAll('[data-turn]');"
+                " if (t.length) t[t.length - 1].scrollIntoView({block: 'end'}); }")
             ready = await page.evaluate(check_js, baseline_srcs)
         except Exception as e:
             log.warning("Ошибка JS-проверки готовности: %s", e)
