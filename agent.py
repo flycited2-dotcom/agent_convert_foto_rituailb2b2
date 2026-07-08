@@ -51,23 +51,29 @@ COMPOSER_SELECTOR = 'div[contenteditable="true"]'
 # лениво ПОСЛЕ снятия baseline и проходили фильтр «свежая + вне user».
 # Осознанный трейдофф: сменится разметка assistant-role — упадём с дампом
 # страницы (ретрай/алерт), но чужое фото в карточку не уедет никогда.
+#
+# 08.07.2026: ChatGPT сменил разметку — assistant-реплика теперь размечена
+# `section[data-turn="assistant"]`, а атрибут `data-message-author-role` пропал →
+# старый селектор находил 0 сообщений и генерация вставала на всех дорожках.
+# Ищем по новому маркеру, старый оставлен fallback'ом (A/B-выкатки ChatGPT).
 FIND_GENERATED_IMG_JS = """
     (baselineList) => {
         const baseline = new Set(baselineList || []);
         const isFresh = im => im.complete && im.naturalWidth > 600
                               && im.src && !baseline.has(im.src);
 
-        const aSelector = [
-            '[data-message-author-role=\\"assistant\\"]',
-            '[data-author-role=\\"assistant\\"]'
-        ].join(', ');
-        const aMsgs = [...document.querySelectorAll(aSelector)];
-        if (aMsgs.length) {
-            const last = aMsgs[aMsgs.length - 1];
+        // Последняя assistant-реплика по указанному селектору → свежая картинка в ней.
+        const pick = (sel) => {
+            const msgs = [...document.querySelectorAll(sel)];
+            if (!msgs.length) return null;
+            const last = msgs[msgs.length - 1];
             const cand = [...last.querySelectorAll('img')].filter(isFresh);
-            if (cand.length) return cand[cand.length - 1];
-        }
-        return null;
+            return cand.length ? cand[cand.length - 1] : null;
+        };
+        // Новая разметка (section[data-turn]) приоритетнее; legacy — fallback.
+        return pick('[data-turn=\\"assistant\\"]')
+            || pick('[data-message-author-role=\\"assistant\\"], '
+                    + '[data-author-role=\\"assistant\\"]');
     }
 """
 
@@ -219,6 +225,9 @@ async def wait_for_generation(
     check_js = f"(baseline) => !!({FIND_GENERATED_IMG_JS.strip()})(baseline)"
     while elapsed < deadline_ms:
         try:
+            # ChatGPT виртуализирует ленту: последний turn выпадает из DOM при
+            # скролле вверх. Держим низ в поле зрения, иначе детект не увидит картинку.
+            await page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
             ready = await page.evaluate(check_js, baseline_srcs)
         except Exception as e:
             log.warning("Ошибка JS-проверки готовности: %s", e)
