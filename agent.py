@@ -222,21 +222,26 @@ async def _dump_page_state(page: Page, tag: str) -> None:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         base = LOGS_DIR / f"timeout_{tag}_{ts}"
         await page.screenshot(path=str(base.with_suffix(".png")), full_page=True)
+        # parentRole учитывает и data-turn (разметка 08.07.2026): без него дампы
+        # «слепы» — 10.07 по parentRole=null нельзя было понять, в каком
+        # контейнере картинка на самом деле (диагностировали по скриншоту)
         info = await page.evaluate(
-            """() => [...document.querySelectorAll('img')].map(im => ({
-                src: (im.src || '').slice(0, 150),
-                alt: im.alt,
-                w: im.naturalWidth,
-                h: im.naturalHeight,
-                complete: im.complete,
-                visible: im.offsetWidth > 0,
-                parentRole: (im.closest('[data-message-author-role], [data-author-role]') || {}).getAttribute
-                    ? (im.closest('[data-message-author-role], [data-author-role]')
-                        .getAttribute('data-message-author-role')
-                        || im.closest('[data-message-author-role], [data-author-role]')
-                            .getAttribute('data-author-role'))
-                    : null
-            }))"""
+            """() => [...document.querySelectorAll('img')].map(im => {
+                const p = im.closest(
+                    '[data-message-author-role], [data-author-role], [data-turn]');
+                return {
+                    src: (im.src || '').slice(0, 150),
+                    alt: im.alt,
+                    w: im.naturalWidth,
+                    h: im.naturalHeight,
+                    complete: im.complete,
+                    visible: im.offsetWidth > 0,
+                    inMain: !!im.closest('main'),
+                    parentRole: p ? (p.getAttribute('data-message-author-role')
+                                     || p.getAttribute('data-author-role')
+                                     || p.getAttribute('data-turn')) : null
+                };
+            })"""
         )
         base.with_suffix(".json").write_text(
             json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8"
