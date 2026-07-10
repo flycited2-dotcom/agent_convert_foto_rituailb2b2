@@ -45,17 +45,26 @@ COMPOSER_SELECTOR = 'div[contenteditable="true"]'
 # baselineList — src которые БЫЛИ на странице после submit+5s settle.
 # Все user-фото к этому моменту уже имеют финальные URL и попадают сюда.
 #
-# ТОЛЬКО последнее assistant-сообщение. Бывший fallback «любая крупная свежая
-# картинка вне user-сообщений» ПРИКЛЕИВАЛ ЧУЖИЕ ФОТО (2026-07-07: карточка
-# EUROHOFF с фото телевизора BQ): превью прошлых генераций проекта подгружаются
-# лениво ПОСЛЕ снятия baseline и проходили фильтр «свежая + вне user».
-# Осознанный трейдофф: сменится разметка assistant-role — упадём с дампом
-# страницы (ретрай/алерт), но чужое фото в карточку не уедет никогда.
+# Бывший fallback «любая крупная свежая картинка вне user-сообщений»
+# ПРИКЛЕИВАЛ ЧУЖИЕ ФОТО (2026-07-07: карточка EUROHOFF с фото телевизора BQ):
+# превью прошлых генераций проекта подгружаются лениво ПОСЛЕ снятия baseline
+# и проходили фильтр «свежая + вне user». Такой fallback НЕ возвращать.
 #
-# 08.07.2026: ChatGPT сменил разметку — assistant-реплика теперь размечена
-# `section[data-turn="assistant"]`, а атрибут `data-message-author-role` пропал →
-# старый селектор находил 0 сообщений и генерация вставала на всех дорожках.
-# Ищем по новому маркеру, старый оставлен fallback'ом (A/B-выкатки ChatGPT).
+# Стратегия 1 (08.07.2026): assistant-реплика теперь `section[data-turn=
+# "assistant"]`, атрибут `data-message-author-role` пропал — ищем по новому
+# маркеру, старый селектор оставлен fallback'ом (A/B-выкатки ChatGPT).
+#
+# Стратегия 2 (10.07.2026): на части аккаунтов сгенерированные картинки
+# рисуются в треде ВНЕ любых assistant-обёрток (одиночные и A/B-пары «Какое
+# изображение вам нравится больше?») — задачи падали «Изображение не
+# появилось за 330 сек» при готовой карточке в чате (856-862, laptop-a1/a2).
+# В отличие от удалённого fallback'а «любую свежую» НЕ берём — картинка
+# обязана: лежать внутри main, вне user-блоков, НИЖЕ последнего сообщения
+# пользователя (ответ всегда под вопросом; превью прошлых генераций — выше)
+# и её src должен быть помечен alt «Сформированное изображение…» — метку
+# ставит сам ChatGPT только сгенерированным (у загрузок в alt — имя файла).
+# Из подходящих берём последнюю по DOM (низ треда; у A/B-пары — второй
+# вариант). Тесты по реальным дампам: tests/test_find_generated_img.py.
 FIND_GENERATED_IMG_JS = """
     (baselineList) => {
         const baseline = new Set(baselineList || []);
@@ -71,9 +80,35 @@ FIND_GENERATED_IMG_JS = """
             return cand.length ? cand[cand.length - 1] : null;
         };
         // Новая разметка (section[data-turn]) приоритетнее; legacy — fallback.
-        return pick('[data-turn=\\"assistant\\"]')
+        const fromAssistant = pick('[data-turn=\\"assistant\\"]')
             || pick('[data-message-author-role=\\"assistant\\"], '
                     + '[data-author-role=\\"assistant\\"]');
+        if (fromAssistant) return fromAssistant;
+
+        // Стратегия 2: картинка в треде без assistant-обёртки.
+        const mainEl = document.querySelector('main');
+        if (!mainEl) return null;
+        const uSelector = [
+            '[data-turn=\\"user\\"]',
+            '[data-message-author-role=\\"user\\"]',
+            '[data-author-role=\\"user\\"]'
+        ].join(', ');
+        const uMsgs = [...document.querySelectorAll(uSelector)];
+        const inUser = im => uMsgs.some(m => m.contains(im));
+        const lastU = uMsgs.length ? uMsgs[uMsgs.length - 1] : null;
+        // 4 = DOCUMENT_POSITION_FOLLOWING: im идёт ПОСЛЕ lastU в документе
+        const afterUser = im => !lastU
+            || !!(lastU.compareDocumentPosition(im) & 4);
+        const genAlt = im => {
+            const a = im.alt || '';
+            return a.startsWith('Сформированное изображение')
+                || a.startsWith('Generated image');
+        };
+        const imgs = [...mainEl.querySelectorAll('img')];
+        const genSrcs = new Set(imgs.filter(genAlt).map(im => im.src));
+        const cand = imgs.filter(im => isFresh(im) && !inUser(im)
+                                       && afterUser(im) && genSrcs.has(im.src));
+        return cand.length ? cand[cand.length - 1] : null;
     }
 """
 

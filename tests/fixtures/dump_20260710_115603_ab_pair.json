@@ -1,0 +1,101 @@
+[
+  {
+    "src": "https://cdn.auth0.com/avatars/ts.png",
+    "alt": "Изображение профиля",
+    "w": 120,
+    "h": 120,
+    "complete": true,
+    "visible": true,
+    "parentRole": null
+  },
+  {
+    "src": "https://cdn.auth0.com/avatars/ts.png",
+    "alt": "Изображение профиля",
+    "w": 120,
+    "h": 120,
+    "complete": true,
+    "visible": true,
+    "parentRole": null
+  },
+  {
+    "src": "https://chatgpt.com/backend-api/estuary/content?id=file_00000000f1f871f4a1037da09328dfb6&gizmo_id=g-p-6a4b79ee295c8191a2a174fe5fe8d998&ts=495464&p=gpp",
+    "alt": "a2181f8e-dfd6-47a4-9ff6-1f48b46a6436.png",
+    "w": 1254,
+    "h": 1254,
+    "complete": true,
+    "visible": true,
+    "parentRole": "user"
+  },
+  {
+    "src": "https://chatgpt.com/backend-api/estuary/content?id=file_00000000c99071f49fc4fa184a676f9a&gizmo_id=g-p-6a4b79ee295c8191a2a174fe5fe8d998&ts=495464&p=gpp",
+    "alt": "0c154c88-ca74-4734-9aba-cd85fc2f1250.png",
+    "w": 1254,
+    "h": 1254,
+    "complete": true,
+    "visible": true,
+    "parentRole": "user"
+  },
+  {
+    "src": "https://chatgpt.com/backend-api/estuary/content?id=file_00000000f4b471f4997c65398847944e&gizmo_id=g-p-6a4b79ee295c8191a2a174fe5fe8d998&ts=495464&p=gpp",
+    "alt": "681fc8bb-e271-4019-b5d5-318b1f98c603.png",
+    "w": 1536,
+    "h": 1024,
+    "complete": true,
+    "visible": true,
+    "parentRole": "user"
+  },
+  {
+    "src": "https://chatgpt.com/backend-api/estuary/content?id=file_00000000722c7243a8bae618b209f8cf&ts=495464&p=fs&cid=1&sig=stub",
+    "alt": "Сформированное изображение: Микроволновая печь DEXP MS-80",
+    "w": 1254,
+    "h": 1254,
+    "complete": true,
+    "visible": true,
+    "parentRole": null
+  },
+  {
+    "src": "https://chatgpt.com/backend-api/estuary/content?id=file_00000000722c7243a8bae618b209f8cf&ts=495464&p=fs&cid=1&sig=stub",
+    "alt": "",
+    "w": 1254,
+    "h": 1254,
+    "complete": true,
+    "visible": true,
+    "parentRole": null
+  },
+  {
+    "src": "https://chatgpt.com/backend-api/estuary/content?id=file_00000000722c7243a8bae618b209f8cf&ts=495464&p=fs&cid=1&sig=stub",
+    "alt": "",
+    "w": 1254,
+    "h": 1254,
+    "complete": true,
+    "visible": true,
+    "parentRole": null
+  },
+  {
+    "src": "https://chatgpt.com/backend-api/estuary/content?id=file_0000000072b87246a37ef1826b0ff706&ts=495464&p=fs&cid=1&sig=stub",
+    "alt": "Сформированное изображение: Современная микроволновая печь HOMELINE",
+    "w": 1254,
+    "h": 1254,
+    "complete": true,
+    "visible": true,
+    "parentRole": null
+  },
+  {
+    "src": "https://chatgpt.com/backend-api/estuary/content?id=file_0000000072b87246a37ef1826b0ff706&ts=495464&p=fs&cid=1&sig=stub",
+    "alt": "",
+    "w": 1254,
+    "h": 1254,
+    "complete": true,
+    "visible": true,
+    "parentRole": null
+  },
+  {
+    "src": "https://chatgpt.com/backend-api/estuary/content?id=file_0000000072b87246a37ef1826b0ff706&ts=495464&p=fs&cid=1&sig=stub",
+    "alt": "",
+    "w": 1254,
+    "h": 1254,
+    "complete": true,
+    "visible": true,
+    "parentRole": null
+  }
+]

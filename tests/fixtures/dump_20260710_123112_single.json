@@ -1,0 +1,74 @@
+[
+  {
+    "src": "https://cdn.auth0.com/avatars/ts.png",
+    "alt": "Изображение профиля",
+    "w": 120,
+    "h": 120,
+    "complete": true,
+    "visible": true,
+    "parentRole": null
+  },
+  {
+    "src": "https://cdn.auth0.com/avatars/ts.png",
+    "alt": "Изображение профиля",
+    "w": 120,
+    "h": 120,
+    "complete": true,
+    "visible": true,
+    "parentRole": null
+  },
+  {
+    "src": "https://chatgpt.com/backend-api/estuary/content?id=file_00000000fe7072439fa140cd59282f16&gizmo_id=g-p-6a4b79ee295c8191a2a174fe5fe8d998&ts=495465&p=gpp",
+    "alt": "e712eea5-018d-4e5a-8b85-8c65efb450cd.png",
+    "w": 1254,
+    "h": 1254,
+    "complete": true,
+    "visible": true,
+    "parentRole": "user"
+  },
+  {
+    "src": "https://chatgpt.com/backend-api/estuary/content?id=file_00000000f53c7243ada3c9bee09240ec&gizmo_id=g-p-6a4b79ee295c8191a2a174fe5fe8d998&ts=495465&p=gpp",
+    "alt": "8d080dc7-89ef-43fd-8975-b482941a2858.png",
+    "w": 1254,
+    "h": 1254,
+    "complete": true,
+    "visible": true,
+    "parentRole": "user"
+  },
+  {
+    "src": "https://chatgpt.com/backend-api/estuary/content?id=file_00000000e6ec72469decb0baccb19505&gizmo_id=g-p-6a4b79ee295c8191a2a174fe5fe8d998&ts=495465&p=gpp",
+    "alt": "0ac60e7f-9de0-45e5-b55d-77b4ea06cb6b.png",
+    "w": 1254,
+    "h": 1254,
+    "complete": true,
+    "visible": true,
+    "parentRole": "user"
+  },
+  {
+    "src": "https://chatgpt.com/backend-api/estuary/content?id=file_00000000662c72438335601957fd4c32&ts=495465&p=fs&cid=1&sig=stub",
+    "alt": "Сформированное изображение: Реклама микроволновки Sakura SA-7208W",
+    "w": 1254,
+    "h": 1254,
+    "complete": true,
+    "visible": true,
+    "parentRole": null
+  },
+  {
+    "src": "https://chatgpt.com/backend-api/estuary/content?id=file_00000000662c72438335601957fd4c32&ts=495465&p=fs&cid=1&sig=stub",
+    "alt": "",
+    "w": 1254,
+    "h": 1254,
+    "complete": true,
+    "visible": true,
+    "parentRole": null
+  },
+  {
+    "src": "https://chatgpt.com/backend-api/estuary/content?id=file_00000000662c72438335601957fd4c32&ts=495465&p=fs&cid=1&sig=stub",
+    "alt": "",
+    "w": 1254,
+    "h": 1254,
+    "complete": true,
+    "visible": true,
+    "parentRole": null
+  }
+]
