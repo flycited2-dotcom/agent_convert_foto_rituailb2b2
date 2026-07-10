@@ -16,11 +16,14 @@ echo  Chrome dlya agenta: port %DEBUG_PORT%, profil %PROFILE_DIR%
 echo ============================================================
 echo Esli profil novyj - vojdi v ChatGPT, sessiya sohranitsya.
 
+REM --hide-crash-restore-bubble: votchdog ubivaet Chrome nasilno (restart) -
+REM bez flaga posle etogo vsplyvaet "Vosstanovit stranicy?" (2026-07-10).
 start "" %CHROME% ^
     --remote-debugging-port=%DEBUG_PORT% ^
     --user-data-dir="%PROFILE_DIR%" ^
     --no-first-run ^
     --no-default-browser-check ^
+    --hide-crash-restore-bubble ^
     --disable-features=TranslateUI ^
     https://chatgpt.com/
 
