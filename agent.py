@@ -573,7 +573,7 @@ async def process_one_file(
             f"эталоны={'все на месте' if all(f.exists() for f in cfg.reference_files) else 'НЕ найдены'}"
         )
 
-    rendered_prompt = cfg.render_prompt(specs)
+    rendered_prompt = cfg.render_prompt(specs, brand=brand, model=model)
     output_path = make_output_path(mode=cfg.key, brand=brand, model=model)
     chat_url = project_url or cfg.project_url or "https://chatgpt.com/"
     log.info(

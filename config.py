@@ -84,11 +84,18 @@ class Mode:
             return any(f.exists() for f in self.reference_files) and bool(self.reference_files)
         return True
 
-    def render_prompt(self, specs: str | None = None) -> str:
-        """Подставить характеристики в плейсхолдер {{SPECS}}."""
+    def render_prompt(self, specs: str | None = None, brand: str | None = None,
+                      model: str | None = None) -> str:
+        """Подставить характеристики в плейсхолдер {{SPECS}}. brand/model — первой
+        строкой «НАЗВАНИЕ ТОВАРА: …»: промпты велят брать бренд из названия товара
+        в сообщении, а без этой строки модель списывала бренд с эталона
+        (2026-07-14: все миксеры вышли «HOMELINE RDF-260DD» — бренд эталона)."""
         if "{{SPECS}}" not in self.prompt:
             return self.prompt
         value = (specs or "").strip() or self.default_specs
+        title = " ".join(x for x in ((brand or "").strip(), (model or "").strip()) if x)
+        if title:
+            value = f"НАЗВАНИЕ ТОВАРА: {title}\n{value}".strip()
         return self.prompt.replace("{{SPECS}}", value)
 
 
