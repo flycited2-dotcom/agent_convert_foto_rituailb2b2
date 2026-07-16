@@ -53,6 +53,13 @@ VPS_API_TOKEN  = os.getenv("VPS_API_TOKEN", "")
 CHROME_CDP_URL = os.getenv("CHROME_CDP_URL", "http://127.0.0.1:9333").rstrip("/")
 POLL_SEC       = int(os.getenv("WATCHDOG_POLL_SEC", "15"))
 WORKER_ID      = os.getenv("WORKER_ID", "").strip()   # адресные флаги: agent_command_<id>
+# Стаггер подъёма дорожек: два Chrome разом душат CPU/сеть (роутер владельца
+# проседает) — поднимаем по одной с паузой (2026-07-15).
+STAGGER_SEC    = int(os.getenv("WATCHDOG_STAGGER_SEC", "90"))
+# Троттлинг напоминания «остановлено вручную, а очередь ждёт» (сек)
+WAKE_NOTE_EVERY = int(os.getenv("WATCHDOG_WAKE_NOTE_SEC", "7200"))
+TG_TOKEN       = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TG_OWNER       = os.getenv("TELEGRAM_ALLOWED_USER_ID", "").strip()
 
 # Дорожки ЭТОЙ машины из lanes.json (Phase 5 мульти-аккаунта): команда из
 # Telegram применяется ко ВСЕМ дорожкам машины (у каждой — свой Chrome-порт/
@@ -178,6 +185,49 @@ def chrome_cdp_alive(lane: Lane | None = None) -> bool:
         return False
 
 
+# ── автопробуждение 'wake' ≠ ручной 'start' (2026-07-15) ────────────────────
+# cf-cards бродкастит команду при постановке задач. Раньше это был 'start' —
+# он перебивал ручной стоп владельца («жму стоп — вотчдог поднимает»). 'wake'
+# поднимает только УПАВШИЕ running-дорожки; остановленные вручную — не трогает,
+# владельцу уходит напоминание (не чаще WAKE_NOTE_EVERY).
+
+def plan_wake(entries: list[tuple[str, str, bool]]) -> tuple[list[str], list[str]]:
+    """entries: (lane_id, desired_state, healthy) → (кого поднять, кому отказано).
+    Чистая функция — тестируется без вотчдога."""
+    start, denied = [], []
+    for lane_id, desired, healthy in entries:
+        if desired == "running":
+            if not healthy:
+                start.append(lane_id)
+        else:
+            denied.append(lane_id)
+    return start, denied
+
+
+_WAKE_NOTE_FILE = _LOGS_DIR / "wake_note_ts.txt"
+
+
+def notify_owner_throttled(text: str) -> None:
+    """Сообщение владельцу в Telegram (токен локального бота из .env),
+    не чаще WAKE_NOTE_EVERY. Без токена/чата — только лог."""
+    try:
+        last = float(_WAKE_NOTE_FILE.read_text().strip())
+    except Exception:
+        last = 0.0
+    if time.time() - last < WAKE_NOTE_EVERY:
+        return
+    log.info("Напоминание владельцу: %s", text)
+    if not (TG_TOKEN and TG_OWNER):
+        return
+    try:
+        httpx.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                   data={"chat_id": TG_OWNER, "text": text},
+                   timeout=15, trust_env=False)
+        _WAKE_NOTE_FILE.write_text(str(time.time()), encoding="utf-8")
+    except Exception as e:
+        log.warning("Напоминание не отправилось: %s", e)
+
+
 def handle_start(lane: Lane | None = None) -> None:
     # Сначала Chrome: агент может работать при мёртвом CDP — тогда задачи
     # будут падать, а START "ничего не делал" (грабля 2026-06-12).
@@ -246,9 +296,30 @@ def main() -> None:
                             if cmd == "start":
                                 log.info("Команда START из Telegram (%d дорожек).",
                                          len(targets()))
-                                for t in targets():
+                                for i, t in enumerate(targets()):
+                                    if i:                       # стаггер: по одной,
+                                        time.sleep(STAGGER_SEC)  # не душим CPU/сеть
                                     set_desired_state("running", t)
                                     handle_start(t)
+                            elif cmd == "wake":
+                                # автопробуждение от cf-cards: поднимает только
+                                # УПАВШИЕ running-дорожки; ручной стоп не перебивает
+                                entries = [((t.id if t else "legacy"), desired_state(t),
+                                            chrome_cdp_alive(t) and agent_running(t))
+                                           for t in targets()]
+                                start_ids, denied = plan_wake(entries)
+                                by_id = {(t.id if t else "legacy"): t for t in targets()}
+                                for i, lane_id in enumerate(start_ids):
+                                    if i:
+                                        time.sleep(STAGGER_SEC)
+                                    log.info("WAKE: поднимаю упавшую [%s]", lane_id)
+                                    handle_start(by_id[lane_id])
+                                if denied and not start_ids:
+                                    notify_owner_throttled(
+                                        "⏸ Дорожки остановлены вручную, а очередь "
+                                        "прислала задачи. Автоподъём не делаю — "
+                                        "запусти кнопкой «🚀 Запустить», когда "
+                                        "лимит остынет.")
                             elif cmd == "restart":
                                 log.info("Команда RESTART из Telegram (%d дорожек).",
                                          len(targets()))
@@ -260,7 +331,9 @@ def main() -> None:
                                     kill_agent(None)  # legacy-агент без LANE_ID
                                                       # (запущен до апдейта)
                                 time.sleep(3)
-                                for t in targets():
+                                for i, t in enumerate(targets()):
+                                    if i:
+                                        time.sleep(STAGGER_SEC)
                                     handle_start(t)
                             elif cmd == "stop":
                                 log.info("Команда STOP из Telegram (%d дорожек).",
@@ -286,6 +359,8 @@ def main() -> None:
                                             "умерли — поднимаю.",
                                             f" [{t.id}]" if t else "")
                                         handle_start(t)
+                                        break   # одну за проход (стаггер: вторая —
+                                                # на следующем тике через ~минуту)
                         except httpx.HTTPError as e:
                             errors += 1
                             log.warning("Сеть: %s (%d подряд)", e, errors)
