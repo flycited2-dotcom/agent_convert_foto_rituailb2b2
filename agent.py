@@ -135,6 +135,9 @@ async def open_new_chat(page: Page, url: str = "https://chatgpt.com/") -> None:
     await page.goto(url, wait_until="domcontentloaded")
     await page.wait_for_selector(COMPOSER_SELECTOR, timeout=20000)
     await asyncio.sleep(1)
+    # модалка «Слишком много запросов» могла остаться с прошлой задачи —
+    # не тратим попытку (вставка фото/сабмит всё равно упрутся в неё)
+    await _raise_if_rate_limited(page)
 
 
 async def paste_image(page: Page, image_path: Path, settle_seconds: float = 4.0) -> None:
@@ -180,6 +183,51 @@ async def _upload_limit_banner_text(page: Page) -> str | None:
     except Exception:
         return None
     return text if is_upload_limit_error(text) else None
+
+
+class GenerationRateLimitError(RuntimeError):
+    """Модалка ChatGPT «Слишком много запросов» (снята вживую 2026-07-16):
+    «Вы отправляете запросы слишком часто. Доступ к вашим диалогам временно
+    ограничен…». Ретраить в лоб бессмысленно — нужен кулдаун «несколько минут»
+    и мягкий возврат задачи в очередь."""
+
+
+# Детект по ТЕКСТУ (не по классам — их OpenAI меняет чаще): первый видимый
+# компактный узел с сигнатурой rate-limit. length<500 отсекает body/main.
+RATE_LIMIT_MODAL_JS = """
+    () => {
+        const rx = /слишком много запросов|запросы слишком часто|временно ограничен|too many requests|sending (?:messages|requests) too (?:quickly|frequently)/i;
+        for (const el of document.querySelectorAll('div, p, h2, span')) {
+            const t = el.innerText || '';
+            if (t && t.length < 500 && rx.test(t) && el.getBoundingClientRect().height > 0)
+                return t.slice(0, 200);
+        }
+        return null;
+    }
+"""
+
+
+async def _rate_limit_modal_text(page: Page) -> str | None:
+    try:
+        return await page.evaluate(RATE_LIMIT_MODAL_JS)
+    except Exception:
+        return None
+
+
+async def _raise_if_rate_limited(page: Page) -> None:
+    """Модалка rate-limit видна → закрыть её («Понятно»/OK, чтобы не блокировала
+    клики после кулдауна) и поднять GenerationRateLimitError."""
+    text = await _rate_limit_modal_text(page)
+    if not text:
+        return
+    try:
+        btn = page.locator(
+            'button:has-text("Понятно"), button:has-text("Got it"), '
+            'button:has-text("OK")').first
+        await btn.click(timeout=3000)
+    except Exception:
+        pass                                   # не закрылась — не страшно
+    raise GenerationRateLimitError(text.strip()[:200])
 
 
 async def submit(page: Page) -> None:
@@ -279,6 +327,10 @@ async def wait_for_generation(
             log.info("Картинка готова, ждём полной загрузки пикселей…")
             await asyncio.sleep(1)
             return
+        if elapsed % 10000 == 0:
+            # rate-limit убивает генерацию молча — без проверки ждали бы весь
+            # таймаут и жгли ретраи (модалка снята вживую 2026-07-16)
+            await _raise_if_rate_limited(page)
         if elapsed > 0 and elapsed % 30000 == 0:
             log.info("Ещё жду… %d сек", elapsed // 1000)
         await asyncio.sleep(2)

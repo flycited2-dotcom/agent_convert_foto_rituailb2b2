@@ -67,7 +67,8 @@ def agent_caps() -> str:
     return "research" if ok else ""
 
 
-from agent import UploadLimitError, process_one_file, process_research  # noqa: E402
+from agent import (GenerationRateLimitError, UploadLimitError,  # noqa: E402
+                   process_one_file, process_research)
 from ssh_tunnel import SSHTunnel  # noqa: E402
 from worker_lease_client import claim_lease  # noqa: E402
 import upload_cooldown  # noqa: E402
@@ -77,6 +78,10 @@ import upload_cooldown  # noqa: E402
 # квоте ChatGPT восстановиться весь день — с кулдауном агент вместо этого замолкает.
 COOLDOWN_PATH = _LOGS_DIR / "upload_cooldown_until.txt"
 COOLDOWN_MINUTES = int(os.getenv("UPLOAD_COOLDOWN_MINUTES", "45"))
+# Кулдаун rate-limit «Слишком много запросов» (модалка снята 2026-07-16):
+# короче лимита загрузок — сама модалка просит «подождите несколько минут».
+RATE_COOLDOWN_PATH = _LOGS_DIR / "rate_limit_cooldown_until.txt"
+RATE_COOLDOWN_MINUTES = int(os.getenv("RATE_LIMIT_COOLDOWN_MINUTES", "10"))
 
 # --- SSH / API config (из .env) ---
 VPS_SSH_HOST  = os.getenv("VPS_SSH_HOST", "186.246.44.204")
@@ -230,12 +235,15 @@ async def agent_loop(api_url: str) -> None:
                 except Exception:
                     pass
 
-                # --- Кулдаун после «Максимальное количество загрузок» ---
+                # --- Кулдауны: лимит загрузок / rate-limit «слишком много запросов» ---
                 now = datetime.now()
-                if upload_cooldown.in_cooldown(COOLDOWN_PATH, now):
+                if (upload_cooldown.in_cooldown(COOLDOWN_PATH, now)
+                        or upload_cooldown.in_cooldown(RATE_COOLDOWN_PATH, now)):
                     if _last_cooldown_log is None or (now - _last_cooldown_log) > timedelta(minutes=5):
-                        until = upload_cooldown.read_cooldown(COOLDOWN_PATH)
-                        log.info("В кулдауне из-за лимита загрузок ChatGPT до %s — жду.", until)
+                        until = max((u for p in (COOLDOWN_PATH, RATE_COOLDOWN_PATH)
+                                     if (u := upload_cooldown.read_cooldown(p)) and u > now),
+                                    default=None)
+                        log.info("В кулдауне (лимит ChatGPT) до %s — жду.", until)
                         _last_cooldown_log = now
                     await asyncio.sleep(POLL_INTERVAL)
                     continue
@@ -414,6 +422,19 @@ async def agent_loop(api_url: str) -> None:
                                 "Задача %d: лимит загрузок ChatGPT исчерпан (%s) — "
                                 "кулдаун до %s, задачу возвращаю в очередь.",
                                 job_id, e, until)
+                            break
+
+                        except GenerationRateLimitError as e:
+                            # «Слишком много запросов» — короткое остывание вместо
+                            # ретраев (они и сжигают квоту), задача мягко в очередь
+                            last_error = e
+                            requeue_job = True
+                            until = upload_cooldown.start_cooldown(
+                                RATE_COOLDOWN_PATH, datetime.now(),
+                                RATE_COOLDOWN_MINUTES)
+                            log.error(
+                                "Задача %d: rate-limit ChatGPT (%s) — кулдаун до %s, "
+                                "задачу возвращаю в очередь.", job_id, e, until)
                             break
 
                         except Exception as e:
